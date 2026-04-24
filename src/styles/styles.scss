@@ -1,0 +1,39 @@
+@use 'tokens';
+
+/* Primary accent override — admin portal uses --admn */
+:root {
+  --primary-color: var(--admn);
+  --primary-color-text: #fff;
+  --surface-ground: var(--canvas);
+  --surface-card: var(--paper);
+  --surface-border: var(--ink-200);
+  --text-color: var(--ink-900);
+  --text-color-secondary: var(--ink-600);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--canvas); color: var(--ink-900); font-family: var(--font-sans); }
+.app-body { min-height: 100vh; }
+
+.brand-title {
+  font-family: var(--font-serif);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}
+.brand-title em { color: var(--admn); font-style: italic; }
+
+.text-meta { font-size: 12px; color: var(--ink-500); }
+.text-label { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-500); font-weight: 600; }
+.card-border { border: 1px solid var(--ink-200); border-radius: var(--r-md); background: var(--paper); box-shadow: var(--shadow-1); }
+
+.btn-admin {
+  background: var(--admn);
+  color: #fff;
+  border: 0;
+  border-radius: var(--r-pill);
+  padding: 12px 18px;
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+}
+.btn-admin:disabled { opacity: 0.45; cursor: not-allowed; }
