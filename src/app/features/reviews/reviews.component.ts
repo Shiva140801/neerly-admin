@@ -5,12 +5,13 @@ import { ReviewService } from './review.service';
 import type { Review, ReviewStatus } from './review.model';
 
 /**
- * Lightweight moderation table. The public/vendor review feed endpoints return
- * review rows with their status + spam flags; admins can hide via
- * `PATCH /api/v1/admin/reviews/{id}/moderate`.
+ * Two-mode moderation surface:
+ *  • Default = global flagged-queue (`/admin/reviews/flagged`) — every
+ *    review the spam detector raised + anything still PENDING_MODERATION,
+ *    sorted by spam score so worst-first.
+ *  • Vendor lookup = enter a vendor UUID for spot-checks of their public feed.
  *
- * In prod this will be paired with a "flagged review queue" backend endpoint —
- * for V1 the admin enters a vendor id to inspect that vendor's feed.
+ * Hide / restore actions PATCH /admin/reviews/{id}/moderate.
  */
 @Component({
   selector: 'app-reviews',
@@ -50,15 +51,16 @@ import type { Review, ReviewStatus } from './review.model';
   template: `
     <h1>Review <em>moderation</em></h1>
     <div class="top">
+      <button class="primary" (click)="loadFlagged()">Flagged queue</button>
       <div>
-        <label>Vendor id</label>
+        <label>or vendor id</label>
         <input [(ngModel)]="vendorId" placeholder="UUID (from Vendors page)" />
       </div>
-      <button class="primary" (click)="load()">Load feed</button>
+      <button class="primary" (click)="loadByVendor()">Load feed</button>
     </div>
 
     @if (loading()) { <div class="empty">Loading…</div> }
-    @else if (items().length === 0) { <div class="empty">Enter a vendor id to inspect their review feed.</div> }
+    @else if (items().length === 0) { <div class="empty">No reviews to moderate.</div> }
     @else {
       <div class="table">
         <table>
@@ -77,7 +79,7 @@ import type { Review, ReviewStatus } from './review.model';
                         [class.hidden]="r.status === 'HIDDEN_SPAM' || r.status === 'HIDDEN_ABUSE' || r.status === 'DELETED'">
                     {{ r.status }}
                   </span>
-                  @if (r.spamFlags?.length) {
+                  @if (r.spamFlags.length) {
                     <div style="margin-top: 4px;">
                       @for (f of r.spamFlags; track f) { <span class="flag">{{ f }}</span> }
                     </div>
@@ -104,19 +106,36 @@ export class ReviewsComponent {
   loading = signal(false);
   items = signal<Review[]>([]);
   vendorId = '';
+  /** Last-load mode: re-runs after a moderation action so the row updates. */
+  private lastMode: 'FLAGGED' | 'VENDOR' = 'FLAGGED';
 
-  load() {
+  constructor() { this.loadFlagged(); }
+
+  loadFlagged() {
+    this.lastMode = 'FLAGGED';
+    this.loading.set(true);
+    this.service.listFlagged().subscribe({
+      next: rows => { this.items.set(rows ?? []); this.loading.set(false); },
+      error: () => { this.items.set([]); this.loading.set(false); }
+    });
+  }
+
+  loadByVendor() {
     if (!this.vendorId.trim()) return;
+    this.lastMode = 'VENDOR';
     this.loading.set(true);
     this.service.listForVendor(this.vendorId.trim()).subscribe({
-      next: rows => { this.items.set(rows); this.loading.set(false); },
-      error: () => this.loading.set(false)
+      next: rows => { this.items.set(rows ?? []); this.loading.set(false); },
+      error: () => { this.items.set([]); this.loading.set(false); }
     });
   }
 
   moderate(r: Review, status: ReviewStatus) {
     const note = status !== 'VISIBLE' ? (prompt('Reason for hiding (optional)') ?? '') : '';
-    this.service.moderate(r.id, { status, note: note || undefined }).subscribe(() => this.load());
+    this.service.moderate(r.id, { status, note: note || undefined }).subscribe(() => {
+      if (this.lastMode === 'FLAGGED') this.loadFlagged();
+      else this.loadByVendor();
+    });
   }
 
   stars(n: number): string { return '★'.repeat(n) + '☆'.repeat(5 - n); }

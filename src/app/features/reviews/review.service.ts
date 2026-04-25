@@ -7,9 +7,14 @@ import type { ModerateReviewRequest, Review } from './review.model';
 export class ReviewService {
   private api = inject(ApiClient);
 
-  // There's no admin list endpoint for moderation — admin uses the vendor public feed
-  // and moderation actions target individual review IDs. In practice admin pulls
-  // flagged rows via /admin/reviews/flagged (future) or vendor feed.
+  // Admin moderation queue — rows the spam detector flagged or anything still
+  // PENDING_MODERATION, sorted by spam score descending.
+  listFlagged(page = 0, size = 20): Observable<Review[]> {
+    return this.api.get(`/admin/reviews/flagged`, { page, size });
+  }
+
+  // Per-vendor lookup — useful for spot-checks and the "view this vendor's
+  // public feed" drawer.
   listForVendor(vendorId: string, page = 0, size = 20): Observable<Review[]> {
     return this.api.get(`/public/vendors/${vendorId}/reviews`, { page, size });
   }
