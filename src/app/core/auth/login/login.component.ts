@@ -83,13 +83,37 @@ export class LoginComponent {
   submitCredentials() {
     this.loading.set(true);
     this.error.set(null);
-    // TODO: Firebase Web SDK — signInWithEmailAndPassword → getIdToken(). Until
-    // that's wired we send the password as a placeholder "firebaseIdToken" so
-    // the flow can be driven end-to-end against a stubbed FirebaseAuthClient
-    // in local dev. In prod the backend rejects this with AUTH_FIREBASE_VERIFY_FAILED
-    // and the UI shows the error inline.
-    const firebaseIdToken = this.password();
 
+    // V1 dev path: hit the local-only /auth/admin/dev-login endpoint, which
+    // bypasses Firebase + TOTP and returns the JWT pair directly. Backend
+    // gates this three ways (profile, enabled flag, password) so it can't
+    // leak to prod. See docs/DEV_ADMIN.md.
+    //
+    // When the real Firebase Web SDK lands, swap this for:
+    //   firebase.auth().signInWithEmailAndPassword(email, password)
+    //     .then(cred => cred.user.getIdToken())
+    //     .then(idToken => this.auth.startLogin(email, idToken, deviceId))
+    this.auth.devLogin(this.email(), this.password(), this.deviceId()).subscribe({
+      next: () => {
+        this.loading.set(false);
+        this.router.navigate(['/dashboard']);
+      },
+      error: (err) => {
+        // If the dev endpoint isn't registered (prod build / wrong profile),
+        // fall back to the real two-step flow.
+        if (err?.status === 403 || err?.status === 404) {
+          this.fallbackToFirebase();
+        } else {
+          this.error.set(this.humanize(err) ?? 'Sign in failed');
+          this.loading.set(false);
+        }
+      }
+    });
+  }
+
+  /** Old two-step flow — kept for prod where dev-login is disabled. */
+  private fallbackToFirebase() {
+    const firebaseIdToken = this.password();
     this.auth.startLogin(this.email(), firebaseIdToken, this.deviceId()).subscribe({
       next: (challenge) => {
         this.challengeId.set(challenge.totpChallengeId);

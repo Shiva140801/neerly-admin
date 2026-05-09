@@ -47,6 +47,28 @@ export class AuthService {
     });
   }
 
+  /**
+   * Local-dev shortcut — POSTs `{email, password, deviceId}` to
+   * `/auth/admin/dev-login` (registered only when SPRING_PROFILES_ACTIVE=local
+   * AND dev.admin.login.enabled=true). Skips Firebase + TOTP entirely; returns
+   * the same ExchangeResponse the real flow returns. Tokens are persisted in
+   * TokenStore so the rest of the app behaves identically afterwards.
+   */
+  devLogin(email: string, password: string, deviceId: string): Observable<ExchangeResponse> {
+    return this.api.post<ExchangeResponse>('/auth/admin/dev-login', {
+      email,
+      password,
+      deviceId
+    }).pipe(map((resp) => {
+      this.tokens.save({
+        accessToken: resp.accessToken,
+        refreshToken: resp.refreshToken,
+        expiresAt: Date.parse(resp.accessExpiresAt)
+      });
+      return resp;
+    }));
+  }
+
   verifyTotp(totpChallengeId: string, code: string): Observable<ExchangeResponse> {
     return this.api.post<ExchangeResponse>('/auth/admin/totp-verify', {
       totpChallengeId,
