@@ -48,7 +48,7 @@ import type { VendorResponse, VendorStatus } from './vendor.model';
     </div>
 
     @if (loading()) { <div class="empty">Loading…</div> }
-    @else if ((vendors().content?.length ?? 0) === 0) {
+    @else if (vendors().content.length === 0) {
       <div class="empty">No vendors in {{ labelFor(selectedStatus()) }}.</div>
     } @else {
       <div class="table">

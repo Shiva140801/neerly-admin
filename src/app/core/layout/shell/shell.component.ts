@@ -35,6 +35,8 @@ import { RouterLink, RouterOutlet, RouterLinkActive } from '@angular/router';
         <a routerLink="/orders" routerLinkActive="active">Orders</a>
         <a routerLink="/payouts" routerLinkActive="active">Payouts</a>
         <a routerLink="/notifications" routerLinkActive="active">Notifications</a>
+        <a routerLink="/analytics" routerLinkActive="active">Analytics</a>
+        <a routerLink="/audit" routerLinkActive="active">Audit log</a>
       </nav>
     </aside>
     <main><router-outlet/></main>
