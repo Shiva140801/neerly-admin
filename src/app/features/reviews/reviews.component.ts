@@ -1,97 +1,162 @@
-import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ReviewService } from './review.service';
 import type { Review, ReviewStatus } from './review.model';
+import { describeError } from '../../shared/api-error';
+import { DataStateComponent } from '../../shared/ui/data-state.component';
+import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import {
+  ConfirmDialogComponent, ConfirmRequest, ConfirmResult
+} from '../../shared/ui/confirm-dialog.component';
+import { Severity, humanize } from '../../shared/ui/urgency';
+
+interface ReviewRow {
+  review: Review;
+  severity: Severity;
+}
 
 /**
- * Two-mode moderation surface:
- *  • Default = global flagged-queue (`/admin/reviews/flagged`) — every
- *    review the spam detector raised + anything still PENDING_MODERATION,
- *    sorted by spam score so worst-first.
- *  • Vendor lookup = enter a vendor UUID for spot-checks of their public feed.
+ * Review moderation.
  *
- * Hide / restore actions PATCH /admin/reviews/{id}/moderate.
+ * The spam detector has already done the ranking work — `spamScore` and
+ * `spamFlags` come back on every row — so the queue's job is to put the most
+ * suspicious review at the top and show the admin *why* it was flagged before
+ * they read the text. Hiding a genuine review costs a vendor real ranking
+ * (rating is 40% of search position, PRD §12.3), so the score is shown as a
+ * number rather than hidden behind a pill.
  */
 @Component({
   selector: 'app-reviews',
   standalone: true,
-  imports: [CommonModule, FormsModule],
+  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
-    h1 { font-family: var(--font-serif); font-weight: 400; font-size: 32px; margin: 0 0 24px; color: var(--ink-900); }
-    h1 em { color: var(--admn); font-style: italic; }
-    .top { display: flex; gap: 12px; margin-bottom: 24px; align-items: end; }
-    label { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--ink-500);
-            font-weight: 600; display: block; margin-bottom: 4px; }
-    input { padding: 8px 10px; border: 1px solid var(--ink-200); border-radius: var(--r-sm);
-            font-size: 14px; background: var(--paper); min-width: 320px; }
-    button.primary { padding: 8px 14px; background: var(--admn); color: #fff; border: 0;
-                     border-radius: var(--r-sm); font-size: 13px; font-weight: 600; cursor: pointer; }
-    .table { background: var(--paper); border: 1px solid var(--ink-200); border-radius: var(--r-md);
-             box-shadow: var(--shadow-1); overflow: hidden; }
-    table { width: 100%; border-collapse: collapse; }
-    th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
-         color: var(--ink-500); font-weight: 600; padding: 14px 16px; border-bottom: 1px solid var(--ink-100); }
-    td { padding: 16px; font-size: 14px; color: var(--ink-800); border-bottom: 1px solid var(--ink-100); }
-    .stars { color: var(--admn); font-weight: 700; }
-    .pill { padding: 3px 8px; border-radius: var(--r-pill); font-size: 11px; font-weight: 600; }
-    .pill.visible { background: var(--ok-soft); color: var(--ok); }
-    .pill.pending { background: var(--warn-soft); color: var(--warn); }
-    .pill.hidden  { background: var(--err-soft); color: var(--err); }
-    .flag { background: var(--err-soft); color: var(--err); padding: 2px 6px;
-            border-radius: var(--r-pill); font-size: 10px; margin-right: 4px; }
-    button.hide, button.show { padding: 6px 10px; border-radius: var(--r-sm);
-      cursor: pointer; font-size: 12px; font-weight: 600; border: 0; }
-    button.hide { background: var(--err-soft); color: var(--err); }
-    button.show { background: var(--ok-soft); color: var(--ok); }
-    .empty { padding: 48px; text-align: center; color: var(--ink-500); font-size: 14px; }
+    .toolbar { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
+    .toolbar .lookup { width: 300px; }
+
+    .stars { font-size: 14px; font-weight: 700; letter-spacing: 1px; color: var(--admn); white-space: nowrap; }
+    .stars.low { color: var(--err); }
+    .body { max-width: 52ch; font-size: 13px; line-height: 1.55; color: var(--ink-800); }
+    .no-text { color: var(--ink-400); font-style: italic; }
+
+    .score { display: flex; align-items: baseline; gap: 5px; }
+    .score .n { font-size: 17px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--ink-700); }
+    .score .n.crit { color: var(--err); }
+    .score .n.warn { color: var(--warn); }
+    .score .u { font-size: 11px; color: var(--ink-500); }
+    .flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 5px; }
+
+    .reply { margin-top: 6px; padding: 8px 10px; background: var(--vend-soft); border-radius: var(--r-sm); font-size: 12px; color: var(--vend-dark); }
   `],
   template: `
-    <h1>Review <em>moderation</em></h1>
-    <div class="top">
-      <button class="primary" (click)="loadFlagged()">Flagged queue</button>
+    <app-page-header
+      title="Review" accent="moderation"
+      subtitle="Sorted by spam score, worst first. Rating is 40% of a vendor's search ranking — hiding a genuine review costs them real orders.">
+      <button type="button" class="btn btn--ghost btn--sm" (click)="loadFlagged()" [disabled]="loading()">
+        {{ loading() ? 'Loading…' : 'Reload flagged' }}
+      </button>
+    </app-page-header>
+
+    <div class="toolbar">
       <div>
-        <label>or vendor id</label>
-        <input [(ngModel)]="vendorId" placeholder="UUID (from Vendors page)" />
+        <span class="field-label">Queue</span>
+        <div class="chips">
+          <button type="button" class="chip" [class.active]="mode() === 'FLAGGED'" (click)="loadFlagged()">
+            Flagged queue
+            @if (mode() === 'FLAGGED' && !loading()) { <span class="count">{{ rows().length }}</span> }
+          </button>
+        </div>
       </div>
-      <button class="primary" (click)="loadByVendor()">Load feed</button>
+      <div>
+        <label class="field-label" for="rv-vendor">Or inspect one vendor's public feed</label>
+        <div class="row-flex gap-8">
+          <input id="rv-vendor" class="input lookup mono" [(ngModel)]="vendorId" placeholder="Vendor UUID" />
+          <button type="button" class="btn btn--ghost btn--sm" (click)="loadByVendor()"
+                  [disabled]="!vendorId.trim()">Load feed</button>
+        </div>
+      </div>
     </div>
 
-    @if (loading()) { <div class="empty">Loading…</div> }
-    @else if (items().length === 0) { <div class="empty">No reviews to moderate.</div> }
-    @else {
-      <div class="table">
-        <table>
-          <thead><tr>
-            <th>Rating</th><th>Text</th><th>Status · flags</th><th>Posted</th><th></th>
-          </tr></thead>
+    @if (loading() || error() || rows().length === 0) {
+      <div class="panel">
+        <app-data-state
+          what="the moderation queue"
+          [loading]="loading()" [error]="error()"
+          [emptyTitle]="mode() === 'FLAGGED' ? 'Nothing flagged' : 'No reviews for that vendor'"
+          [emptyDetail]="mode() === 'FLAGGED'
+            ? 'The spam detector has not raised anything, and no review is sitting in pending moderation.'
+            : 'That vendor has no public reviews yet, or the id does not match a vendor.'"
+          [clear]="mode() === 'FLAGGED'"
+          (retry)="mode() === 'FLAGGED' ? loadFlagged() : loadByVendor()" />
+      </div>
+    } @else {
+      <div class="panel table-wrap">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>Spam score</th>
+              <th>Rating</th>
+              <th>What the customer wrote</th>
+              <th>Status</th>
+              <th>Posted</th>
+              <th class="right">Moderate</th>
+            </tr>
+          </thead>
           <tbody>
-            @for (r of items(); track r.id) {
-              <tr>
-                <td><span class="stars">{{ stars(r.rating) }}</span></td>
-                <td style="max-width: 480px;">{{ r.text ?? '—' }}</td>
+            @for (r of rows(); track r.review.id) {
+              <tr [class.sev-crit]="r.severity === 'crit'" [class.sev-warn]="r.severity === 'warn'">
                 <td>
-                  <span class="pill"
-                        [class.visible]="r.status === 'VISIBLE'"
-                        [class.pending]="r.status === 'PENDING_MODERATION'"
-                        [class.hidden]="r.status === 'HIDDEN_SPAM' || r.status === 'HIDDEN_ABUSE' || r.status === 'DELETED'">
-                    {{ r.status }}
+                  <span class="score">
+                    <span class="n" [class.crit]="r.severity === 'crit'" [class.warn]="r.severity === 'warn'">
+                      {{ r.review.spamScore | number:'1.2-2' }}
+                    </span>
+                    <span class="u">/ 1.00</span>
                   </span>
-                  @if (r.spamFlags.length) {
-                    <div style="margin-top: 4px;">
-                      @for (f of r.spamFlags; track f) { <span class="flag">{{ f }}</span> }
-                    </div>
+                  @if (r.review.spamFlags.length) {
+                    <span class="flags">
+                      @for (f of r.review.spamFlags; track f) { <span class="pill pill--crit">{{ label(f) }}</span> }
+                    </span>
+                  } @else {
+                    <div class="sub-cell">no detector flags</div>
                   }
                 </td>
-                <td>{{ r.createdAt | date:'mediumDate' }}</td>
                 <td>
-                  @if (r.status === 'VISIBLE' || r.status === 'PENDING_MODERATION') {
-                    <button class="hide" (click)="moderate(r, 'HIDDEN_ABUSE')">Hide (abuse)</button>
+                  <span class="stars" [class.low]="r.review.rating <= 2">{{ stars(r.review.rating) }}</span>
+                  <div class="sub-cell">{{ r.review.rating }} of 5</div>
+                </td>
+                <td>
+                  @if (r.review.text) {
+                    <div class="body">{{ r.review.text }}</div>
                   } @else {
-                    <button class="show" (click)="moderate(r, 'VISIBLE')">Restore</button>
+                    <div class="body no-text">Rating only — no written review.</div>
                   }
+                  @if (r.review.vendorResponse) {
+                    <div class="reply">Vendor replied: {{ r.review.vendorResponse.text }}</div>
+                  }
+                </td>
+                <td>
+                  <span class="pill"
+                        [class.pill--ok]="r.review.status === 'VISIBLE'"
+                        [class.pill--warn]="r.review.status === 'PENDING_MODERATION'"
+                        [class.pill--crit]="r.review.status !== 'VISIBLE' && r.review.status !== 'PENDING_MODERATION'">
+                    {{ label(r.review.status) }}
+                  </span>
+                </td>
+                <td>{{ r.review.createdAt | date:'d MMM y' }}</td>
+                <td class="right">
+                  <span class="row-flex gap-6" style="justify-content:flex-end;">
+                    @if (r.review.status === 'VISIBLE' || r.review.status === 'PENDING_MODERATION') {
+                      <button type="button" class="btn btn--ghost btn--sm" (click)="askModerate(r.review, 'VISIBLE')"
+                              [disabled]="busyId() === r.review.id">Keep</button>
+                      <button type="button" class="btn btn--danger btn--sm" (click)="askModerate(r.review, 'HIDDEN_ABUSE')"
+                              [disabled]="busyId() === r.review.id">Hide</button>
+                    } @else {
+                      <button type="button" class="btn btn--ghost btn--sm" (click)="askModerate(r.review, 'VISIBLE')"
+                              [disabled]="busyId() === r.review.id">Restore</button>
+                    }
+                  </span>
                 </td>
               </tr>
             }
@@ -99,44 +164,111 @@ import type { Review, ReviewStatus } from './review.model';
         </table>
       </div>
     }
+
+    @if (actionError(); as e) {
+      <div class="panel mt-16"><div class="panel-body" style="color:var(--err-ink);font-weight:600;">{{ e }}</div></div>
+    }
+
+    <app-confirm-dialog [request]="confirm()" [busy]="busyId() !== null"
+                        (confirmed)="runConfirmed($event)" (cancelled)="confirm.set(null)" />
   `
 })
 export class ReviewsComponent {
   private service = inject(ReviewService);
+
   loading = signal(false);
+  error = signal<string | null>(null);
+  actionError = signal<string | null>(null);
+  busyId = signal<string | null>(null);
   items = signal<Review[]>([]);
   vendorId = '';
-  /** Last-load mode: re-runs after a moderation action so the row updates. */
-  private lastMode: 'FLAGGED' | 'VENDOR' = 'FLAGGED';
+
+  mode = signal<'FLAGGED' | 'VENDOR'>('FLAGGED');
+
+  confirm = signal<ConfirmRequest | null>(null);
+  private pending: ((r: ConfirmResult) => void) | null = null;
 
   constructor() { this.loadFlagged(); }
 
+  label(v: string) { return humanize(v); }
+  stars(n: number): string { return '★'.repeat(n) + '☆'.repeat(Math.max(0, 5 - n)); }
+
+  readonly rows = computed<ReviewRow[]>(() =>
+    [...this.items()]
+      .map(review => {
+        const score = Number(review.spamScore ?? 0);
+        const severity: Severity = score >= 0.7 || review.spamFlags.length >= 2 ? 'crit'
+          : score >= 0.4 || review.spamFlags.length > 0 ? 'warn' : 'ok';
+        return { review, severity };
+      })
+      .sort((a, b) => Number(b.review.spamScore ?? 0) - Number(a.review.spamScore ?? 0)));
+
   loadFlagged() {
-    this.lastMode = 'FLAGGED';
+    this.mode.set('FLAGGED');
     this.loading.set(true);
-    this.service.listFlagged().subscribe({
+    this.error.set(null);
+    this.service.listFlagged(0, 100).subscribe({
       next: rows => { this.items.set(rows ?? []); this.loading.set(false); },
-      error: () => { this.items.set([]); this.loading.set(false); }
+      error: e => {
+        this.error.set(describeError(e, 'the moderation queue'));
+        this.items.set([]);
+        this.loading.set(false);
+      }
     });
   }
 
   loadByVendor() {
     if (!this.vendorId.trim()) return;
-    this.lastMode = 'VENDOR';
+    this.mode.set('VENDOR');
     this.loading.set(true);
-    this.service.listForVendor(this.vendorId.trim()).subscribe({
+    this.error.set(null);
+    this.service.listForVendor(this.vendorId.trim(), 0, 100).subscribe({
       next: rows => { this.items.set(rows ?? []); this.loading.set(false); },
-      error: () => { this.items.set([]); this.loading.set(false); }
+      error: e => {
+        this.error.set(describeError(e, "that vendor's reviews"));
+        this.items.set([]);
+        this.loading.set(false);
+      }
     });
   }
 
-  moderate(r: Review, status: ReviewStatus) {
-    const note = status !== 'VISIBLE' ? (prompt('Reason for hiding (optional)') ?? '') : '';
-    this.service.moderate(r.id, { status, note: note || undefined }).subscribe(() => {
-      if (this.lastMode === 'FLAGGED') this.loadFlagged();
-      else this.loadByVendor();
+  askModerate(r: Review, status: ReviewStatus) {
+    const hiding = status !== 'VISIBLE';
+    this.confirm.set({
+      title: hiding ? 'Hide this review' : 'Keep this review public',
+      message: hiding
+        ? `${r.rating}★ review is pulled from the vendor's public profile and stops counting toward their rating.`
+        : `${r.rating}★ review stays on the vendor's public profile and counts toward their rating.`,
+      confirmLabel: hiding ? 'Hide review' : 'Keep visible',
+      tone: hiding ? 'danger' : 'ok',
+      reason: {
+        label: hiding ? 'Reason' : 'Note (optional)',
+        placeholder: hiding ? 'Why this is abuse or spam rather than a real complaint.' : 'Why you cleared the flag.',
+        required: hiding
+      },
+      consequence: hiding
+        ? 'Average rating is 40% of a vendor’s search ranking — hiding a genuine review costs them orders.'
+        : undefined
     });
+    this.pending = res => this.moderate(r, status, res.reason);
   }
 
-  stars(n: number): string { return '★'.repeat(n) + '☆'.repeat(5 - n); }
+  runConfirmed(result: ConfirmResult) {
+    const run = this.pending;
+    this.confirm.set(null);
+    this.pending = null;
+    run?.(result);
+  }
+
+  moderate(r: Review, status: ReviewStatus, note = '') {
+    this.busyId.set(r.id);
+    this.actionError.set(null);
+    this.service.moderate(r.id, { status, note: note || undefined }).subscribe({
+      next: () => {
+        this.busyId.set(null);
+        if (this.mode() === 'FLAGGED') this.loadFlagged(); else this.loadByVendor();
+      },
+      error: e => { this.actionError.set(describeError(e, 'the moderation action')); this.busyId.set(null); }
+    });
+  }
 }
