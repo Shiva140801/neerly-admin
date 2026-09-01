@@ -3,13 +3,17 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ReviewService } from './review.service';
 import type { Review, ReviewStatus } from './review.model';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { DirectoryService } from '../../shared/directory.service';
+import { label as enumLabel } from '../../shared/labels';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
   ConfirmDialogComponent, ConfirmRequest, ConfirmResult
 } from '../../shared/ui/confirm-dialog.component';
-import { Severity, humanize } from '../../shared/ui/urgency';
+import { Severity } from '../../shared/ui/urgency';
 
 interface ReviewRow {
   review: Review;
@@ -29,11 +33,10 @@ interface ReviewRow {
 @Component({
   selector: 'app-reviews',
   standalone: true,
-  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
+  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent, WhenPipe],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
-    .toolbar { display: flex; align-items: flex-end; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
     .toolbar .lookup { width: 300px; }
 
     .stars { font-size: 14px; font-weight: 700; letter-spacing: 1px; color: var(--admn); white-space: nowrap; }
@@ -59,7 +62,7 @@ interface ReviewRow {
       </button>
     </app-page-header>
 
-    <div class="toolbar">
+    <div class="toolbar toolbar--ends">
       <div>
         <span class="field-label">Queue</span>
         <div class="chips">
@@ -71,8 +74,13 @@ interface ReviewRow {
       </div>
       <div>
         <label class="field-label" for="rv-vendor">Or inspect one vendor's public feed</label>
+        <!-- Was a free-text "Vendor UUID" box. No UUID is displayed anywhere in
+             the portal, so it could only ever be filled in wrong. -->
         <div class="row-flex gap-8">
-          <input id="rv-vendor" class="input lookup mono" [(ngModel)]="vendorId" placeholder="Vendor UUID" />
+          <select id="rv-vendor" class="input lookup" [(ngModel)]="vendorId">
+            <option value="">Choose a vendor…</option>
+            @for (v of vendorOptions(); track v.id) { <option [value]="v.id">{{ v.name }}</option> }
+          </select>
           <button type="button" class="btn btn--ghost btn--sm" (click)="loadByVendor()"
                   [disabled]="!vendorId.trim()">Load feed</button>
         </div>
@@ -87,7 +95,7 @@ interface ReviewRow {
           [emptyTitle]="mode() === 'FLAGGED' ? 'Nothing flagged' : 'No reviews for that vendor'"
           [emptyDetail]="mode() === 'FLAGGED'
             ? 'The spam detector has not raised anything, and no review is sitting in pending moderation.'
-            : 'That vendor has no public reviews yet, or the id does not match a vendor.'"
+            : 'This vendor has no public reviews yet.'"
           [clear]="mode() === 'FLAGGED'"
           (retry)="mode() === 'FLAGGED' ? loadFlagged() : loadByVendor()" />
       </div>
@@ -144,7 +152,7 @@ interface ReviewRow {
                     {{ label(r.review.status) }}
                   </span>
                 </td>
-                <td>{{ r.review.createdAt | date:'d MMM y' }}</td>
+                <td>{{ r.review.createdAt | when:'date' }}</td>
                 <td class="right">
                   <span class="row-flex gap-6" style="justify-content:flex-end;">
                     @if (r.review.status === 'VISIBLE' || r.review.status === 'PENDING_MODERATION') {
@@ -175,6 +183,8 @@ interface ReviewRow {
 })
 export class ReviewsComponent {
   private service = inject(ReviewService);
+  private toasts = inject(ToastService);
+  private directory = inject(DirectoryService);
 
   loading = signal(false);
   error = signal<string | null>(null);
@@ -188,9 +198,15 @@ export class ReviewsComponent {
   confirm = signal<ConfirmRequest | null>(null);
   private pending: ((r: ConfirmResult) => void) | null = null;
 
-  constructor() { this.loadFlagged(); }
+  constructor() {
+    this.loadFlagged();
+    this.directory.ensureLoaded();
+  }
 
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
+
+  /** Vendors by name, so the lookup never needs a UUID typed into it. */
+  readonly vendorOptions = computed(() => this.directory.vendorOptions());
   stars(n: number): string { return '★'.repeat(n) + '☆'.repeat(Math.max(0, 5 - n)); }
 
   readonly rows = computed<ReviewRow[]>(() =>
@@ -225,7 +241,7 @@ export class ReviewsComponent {
     this.service.listForVendor(this.vendorId.trim(), 0, 100).subscribe({
       next: rows => { this.items.set(rows ?? []); this.loading.set(false); },
       error: e => {
-        this.error.set(describeError(e, "that vendor's reviews"));
+        this.error.set(describeError(e, "this vendor's reviews"));
         this.items.set([]);
         this.loading.set(false);
       }
@@ -266,9 +282,15 @@ export class ReviewsComponent {
     this.service.moderate(r.id, { status, note: note || undefined }).subscribe({
       next: () => {
         this.busyId.set(null);
+        this.toasts.success(
+          status === 'VISIBLE' ? `${r.rating}★ review kept public` : `${r.rating}★ review hidden`,
+          status === 'VISIBLE'
+            ? 'It stays on the vendor profile and keeps counting toward their rating.'
+            : 'Pulled from the vendor profile and no longer counted toward their rating.'
+        );
         if (this.mode() === 'FLAGGED') this.loadFlagged(); else this.loadByVendor();
       },
-      error: e => { this.actionError.set(describeError(e, 'the moderation action')); this.busyId.set(null); }
+      error: e => { this.actionError.set(describeActionError(e, 'moderating this review')); this.busyId.set(null); }
     });
   }
 }

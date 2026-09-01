@@ -2,14 +2,19 @@ import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@a
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ApiClient } from '../../core/api/api-client';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { DirectoryService, unknownParty } from '../../shared/directory.service';
+import { label as enumLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { formatRupees } from '../../shared/ui/format';
+import { RupeesPipe, WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
   ConfirmDialogComponent, ConfirmRequest, ConfirmResult
 } from '../../shared/ui/confirm-dialog.component';
-import { Severity, formatDuration, humanize, msSince } from '../../shared/ui/urgency';
+import { Severity, formatDuration, msSince } from '../../shared/ui/urgency';
 
 type PayoutStatus = 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'ON_HOLD';
 
@@ -40,7 +45,7 @@ interface PayoutRow {
 /**
  * Vendor payout run.
  *
- * V1.0 settles off-platform: the weekly job stakes out the rows, the bank
+ * V1.0 settles off-platform: the weekly job works out the amounts, the bank
  * transfer happens by hand, and the admin marks each one paid with a UTR. That
  * makes the interesting number *how long a vendor has been owed money* — a
  * pending payout is a supply-side relationship risk, not a ledger entry. So the
@@ -50,11 +55,13 @@ interface PayoutRow {
 @Component({
   selector: 'app-payouts',
   standalone: true,
-  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
+  imports: [
+    CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent,
+    WhenPipe, RupeesPipe
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
-    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
 
     .totals { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--ink-100); margin-bottom: 18px; border-radius: var(--r-md); overflow: hidden; border: 1px solid var(--ink-200); }
     .total { background: var(--paper); padding: 14px 16px; }
@@ -72,7 +79,7 @@ interface PayoutRow {
   template: `
     <app-page-header
       title="Payout" accent="run"
-      subtitle="V1.0 settles by hand: the job stages the rows, you transfer, then record the UTR. Longest-owed first.">
+      subtitle="Settled by hand for now: the weekly job works out who is owed what, you make the bank transfer, then record the UTR here. Longest-owed first.">
       <button type="button" class="btn btn--ghost btn--sm" (click)="reload()" [disabled]="loading()">
         {{ loading() ? 'Refreshing…' : 'Refresh' }}
       </button>
@@ -81,27 +88,36 @@ interface PayoutRow {
       </button>
     </app-page-header>
 
+    @if (lastRun(); as run) {
+      <!-- The job returned 200 and changed nothing visible, so success and
+           silence were indistinguishable on a money screen. It now says what it
+           found, including when the answer is "nothing". -->
+      <div class="lede" [class.ok]="run.staged > 0" [class.warn]="run.staged === 0" role="status">
+        {{ run.text }}
+      </div>
+    }
+
     @if (!loading() && !error() && items().length > 0) {
       <div class="totals">
         <div class="total">
           <div class="k">Owed to vendors</div>
-          <div class="v" [class.warn]="owed() > 0">₹{{ owed() | number:'1.0-0' }}</div>
+          <div class="v" [class.warn]="owed() > 0">{{ owed() | rupees }}</div>
           <div class="n">{{ pendingCount() }} payout{{ pendingCount() === 1 ? '' : 's' }} pending transfer</div>
         </div>
         <div class="total">
           <div class="k">On hold</div>
-          <div class="v">₹{{ held() | number:'1.0-0' }}</div>
+          <div class="v">{{ held() | rupees }}</div>
           <div class="n">blocked on a decision, not a bank</div>
         </div>
         <div class="total">
           <div class="k">Commission earned</div>
-          <div class="v">₹{{ commission() | number:'1.0-0' }}</div>
+          <div class="v">{{ commission() | rupees }}</div>
           <div class="n">across every row shown</div>
         </div>
       </div>
     }
 
-    <div class="toolbar">
+    <div class="toolbar toolbar--split">
       <div class="chips">
         @for (s of statuses; track $index) {
           <button type="button" class="chip" [class.active]="filter() === s" (click)="filter.set(s); reload()">
@@ -117,7 +133,7 @@ interface PayoutRow {
           what="the payout run"
           [loading]="loading()" [error]="error()"
           emptyTitle="No payouts in this view"
-          emptyDetail="The weekly job stages payouts every Monday morning. Run it manually above if a scheduled run was missed."
+          emptyDetail="The weekly job works out who is owed what every Monday morning. Run it manually above if a scheduled run was missed."
           [clear]="filter() === 'PENDING'"
           (retry)="reload()" />
       </div>
@@ -142,16 +158,16 @@ interface PayoutRow {
                   <div class="age" [class.crit]="r.severity === 'crit'" [class.warn]="r.severity === 'warn'">
                     {{ r.ageMs !== null ? dur(r.ageMs) : '—' }}
                   </div>
-                  <div class="sub-cell">staged {{ r.payout.createdAt | date:'d MMM' }}</div>
+                  <div class="sub-cell">staged {{ r.payout.createdAt | when:'date' }}</div>
                 </td>
-                <td>{{ r.payout.periodStart | date:'d MMM' }} – {{ r.payout.periodEnd | date:'d MMM' }}</td>
-                <td class="mono" style="font-size:12px;">{{ r.payout.vendorId.slice(0, 8) }}</td>
+                <td>{{ r.payout.periodStart | when:'date' }} – {{ r.payout.periodEnd | when:'date' }}</td>
+                <td>{{ vendorName(r.payout) }}</td>
                 <td class="right">
-                  <span class="amt">₹{{ r.payout.netTotal | number:'1.2-2' }}</span>
+                  <span class="amt">{{ r.payout.netTotal | rupees }}</span>
                   <div class="split">
-                    ₹{{ r.payout.grossTotal | number:'1.0-0' }} gross
-                    − ₹{{ r.payout.commissionTotal | number:'1.0-0' }} commission
-                    − ₹{{ r.payout.taxTotal | number:'1.0-0' }} tax
+                    {{ r.payout.grossTotal | rupees }} gross
+                    − {{ r.payout.commissionTotal | rupees }} commission
+                    − {{ r.payout.taxTotal | rupees }} tax
                   </div>
                 </td>
                 <td>
@@ -194,7 +210,11 @@ interface PayoutRow {
     }
 
     @if (actionError(); as e) {
-      <div class="panel mt-16"><div class="panel-body" style="color:var(--err-ink);font-weight:600;">{{ e }}</div></div>
+      <div class="lede crit mt-16" role="alert">
+        {{ e }}
+        <button type="button" class="btn btn--ghost btn--sm" style="margin-left:10px;"
+                (click)="actionError.set(null)">Dismiss</button>
+      </div>
     }
 
     <app-confirm-dialog [request]="confirm()" [busy]="busyId() !== null || running()"
@@ -204,6 +224,11 @@ interface PayoutRow {
 export class PayoutsComponent {
   private api = inject(ApiClient);
   private clock = inject(ClockService);
+  private toasts = inject(ToastService);
+  private directory = inject(DirectoryService);
+
+  /** What the last manual job run actually did — see the strip in the template. */
+  lastRun = signal<{ staged: number; text: string } | null>(null);
 
   statuses: (PayoutStatus | null)[] = [null, 'PENDING', 'ON_HOLD', 'PROCESSING', 'COMPLETED', 'FAILED'];
   filter = signal<PayoutStatus | null>(null);
@@ -217,10 +242,18 @@ export class PayoutsComponent {
   confirm = signal<ConfirmRequest | null>(null);
   private pending: ((r: ConfirmResult) => void) | null = null;
 
-  constructor() { this.reload(); }
+  constructor() {
+    this.reload();
+    this.directory.ensureLoaded();
+  }
 
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
   dur(ms: number) { return formatDuration(ms); }
+
+  /** A payout names its vendor by id alone; the name comes from the vendor list. */
+  vendorName(p: Payout): string {
+    return this.directory.vendorName(p.vendorId) ?? unknownParty('vendor', p.vendorId);
+  }
 
   readonly rows = computed<PayoutRow[]>(() => {
     const now = this.clock.now();
@@ -272,7 +305,7 @@ export class PayoutsComponent {
   askHold(p: Payout) {
     this.confirm.set({
       title: 'Hold payout',
-      message: `₹${Number(p.netTotal).toFixed(2)} to vendor ${p.vendorId.slice(0, 8)} stays put until released.`,
+      message: `${formatRupees(p.netTotal)} to ${this.vendorName(p)} stays put until released.`,
       confirmLabel: 'Place on hold',
       tone: 'danger',
       reason: { label: 'Hold reason', placeholder: 'Stale bank details, open dispute, pending claim…', required: true }
@@ -283,7 +316,7 @@ export class PayoutsComponent {
   askRelease(p: Payout) {
     this.confirm.set({
       title: 'Release payout',
-      message: `₹${Number(p.netTotal).toFixed(2)} goes back into the pending queue for transfer.`,
+      message: `${formatRupees(p.netTotal)} to ${this.vendorName(p)} goes back into the pending queue for transfer.`,
       confirmLabel: 'Release',
       tone: 'primary'
     });
@@ -293,7 +326,7 @@ export class PayoutsComponent {
   askComplete(p: Payout) {
     this.confirm.set({
       title: 'Mark as paid',
-      message: `Records ₹${Number(p.netTotal).toFixed(2)} as settled to vendor ${p.vendorId.slice(0, 8)}.`,
+      message: `Records ${formatRupees(p.netTotal)} as settled to ${this.vendorName(p)}.`,
       confirmLabel: 'Record payment',
       tone: 'ok',
       reason: { label: 'UTR / bank reference', placeholder: 'e.g. N123456789012345', required: true },
@@ -312,9 +345,48 @@ export class PayoutsComponent {
   private runWeekly() {
     this.running.set(true);
     this.actionError.set(null);
+    this.lastRun.set(null);
+    const before = new Set(this.items().map(p => p.id));
+
     this.api.post('/admin/payouts/run').subscribe({
-      next: () => { this.running.set(false); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'the payout job')); this.running.set(false); }
+      // The endpoint answers 200 with nothing useful, so "did anything happen"
+      // is settled by comparing the board before and after — a real observation,
+      // not a claim the UI makes on the job's behalf.
+      next: () => {
+        this.api.get<Payout[]>('/admin/payouts', { page: 0, size: 200 }).subscribe({
+          next: rows => {
+            const all = Array.isArray(rows) ? rows : [];
+            const fresh = all.filter(p => !before.has(p.id));
+            const owed = fresh.reduce((sum, p) => sum + Number(p.netTotal ?? 0), 0);
+            const summary = fresh.length
+              ? {
+                  staged: fresh.length,
+                  text: `The job staged ${fresh.length} new payout${fresh.length === 1 ? '' : 's'} worth ${formatRupees(owed)}. They are in the list below, waiting on a bank transfer.`
+                }
+              : {
+                  staged: 0,
+                  text: 'The job ran and found nothing new to stage — every vendor with settled orders in the last completed week has already been paid or is already queued. Nothing changed.'
+                };
+            this.lastRun.set(summary);
+            if (fresh.length) {
+              this.toasts.success(
+                `${fresh.length} payout${fresh.length === 1 ? '' : 's'} staged`,
+                `${formatRupees(owed)} now waiting on a bank transfer.`
+              );
+            } else {
+              this.toasts.warn('Payout job ran — nothing to stage', 'No vendor is newly owed for the last completed week.');
+            }
+            this.running.set(false);
+            this.reload();
+          },
+          error: () => {
+            // The job itself succeeded; only the read-back failed.
+            this.lastRun.set({ staged: 0, text: 'The job ran, but the board could not be re-read to show what it staged. Refresh to see the current state.' });
+            this.running.set(false);
+          }
+        });
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'running the payout job')); this.running.set(false); }
     });
   }
 
@@ -322,8 +394,12 @@ export class PayoutsComponent {
     this.busyId.set(p.id);
     this.actionError.set(null);
     this.api.post(`/admin/payouts/${p.id}/hold`, { reason }).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'the hold')); this.busyId.set(null); }
+      next: () => {
+        this.busyId.set(null);
+        this.toasts.success(`${formatRupees(p.netTotal)} held`, `${this.vendorName(p)} will not be paid until you release it.`);
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'holding this payout')); this.busyId.set(null); }
     });
   }
 
@@ -331,8 +407,12 @@ export class PayoutsComponent {
     this.busyId.set(p.id);
     this.actionError.set(null);
     this.api.post(`/admin/payouts/${p.id}/release`).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'the release')); this.busyId.set(null); }
+      next: () => {
+        this.busyId.set(null);
+        this.toasts.success(`${formatRupees(p.netTotal)} released`, `Back in the pending queue for ${this.vendorName(p)}.`);
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'releasing this payout')); this.busyId.set(null); }
     });
   }
 
@@ -341,8 +421,15 @@ export class PayoutsComponent {
     this.actionError.set(null);
     // mark-completed takes the UTR as a query parameter, not a body.
     this.api.post(`/admin/payouts/${p.id}/mark-completed?utr=${encodeURIComponent(utr)}`).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'the settlement')); this.busyId.set(null); }
+      next: () => {
+        this.busyId.set(null);
+        this.toasts.success(
+          `${formatRupees(p.netTotal)} recorded as paid`,
+          `${this.vendorName(p)} settled against UTR ${utr}. This cannot be walked back.`
+        );
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'recording this settlement')); this.busyId.set(null); }
     });
   }
 }

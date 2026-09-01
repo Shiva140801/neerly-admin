@@ -6,6 +6,8 @@ import type { AdminAnalyticsSummary } from '../../shared/attention.service';
 import { describeError } from '../../shared/api-error';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { formatRupees } from '../../shared/ui/format';
+import { CountPipe, RupeesPipe } from '../../shared/ui/format.pipe';
 
 /**
  * Platform health.
@@ -19,7 +21,7 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
 @Component({
   selector: 'app-analytics',
   standalone: true,
-  imports: [CommonModule, RouterLink, PageHeaderComponent, DataStateComponent],
+  imports: [CommonModule, RouterLink, PageHeaderComponent, DataStateComponent, RupeesPipe, CountPipe],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
@@ -80,14 +82,14 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
       <div class="hero">
         <div>
           <div class="k">North star · WAPC</div>
-          <div class="v">{{ d.wapc | number }}</div>
+          <div class="v">{{ d.wapc | count }}</div>
           <div class="n">Weekly active paying customers — unique people with at least one delivered order in the last seven days. Everything else is a means to this.</div>
         </div>
         <div class="side">
           <div class="sk">Active subscriptions</div>
-          <div class="sv">{{ d.activeSubscriptions | number }}</div>
+          <div class="sv">{{ d.activeSubscriptions | count }}</div>
           <div class="sk mt-12">Live vendors</div>
-          <div class="sv">{{ d.activeVendors | number }}</div>
+          <div class="sv">{{ d.activeVendors | count }}</div>
         </div>
       </div>
 
@@ -96,17 +98,17 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
         <div class="grid">
           <div class="tile">
             <div class="k">Orders placed</div>
-            <div class="v">{{ d.ordersToday | number }}</div>
+            <div class="v">{{ d.ordersToday | count }}</div>
             <div class="n">Every order created in the last 24 hours, whatever happened to it after.</div>
           </div>
           <div class="tile">
             <div class="k">Delivered</div>
-            <div class="v ok">{{ d.deliveredToday | number }}</div>
+            <div class="v ok">{{ d.deliveredToday | count }}</div>
             <div class="n">{{ completion() }}</div>
           </div>
           <div class="tile">
             <div class="k">Gross revenue</div>
-            <div class="v">₹{{ d.grossRevenueToday | number:'1.0-0' }}</div>
+            <div class="v">{{ d.grossRevenueToday | rupees }}</div>
             <div class="n">Order value from placed through delivered. Cancelled and failed orders are excluded.</div>
           </div>
           <div class="tile">
@@ -122,13 +124,13 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
         <div class="grid">
           <div class="tile">
             <div class="k">Open disputes</div>
-            <div class="v" [class.warn]="d.openComplaints > 0">{{ d.openComplaints | number }}</div>
+            <div class="v" [class.warn]="d.openComplaints > 0">{{ d.openComplaints | count }}</div>
             <div class="n">Filed and not yet closed. <a class="link" routerLink="/disputes">Work the queue →</a></div>
           </div>
           <div class="tile">
             <div class="k">SLA breached</div>
             <div class="v" [class.crit]="d.slaBreachedComplaints > 0" [class.ok]="d.slaBreachedComplaints === 0">
-              {{ d.slaBreachedComplaints | number }}
+              {{ d.slaBreachedComplaints | count }}
             </div>
             <div class="n">{{ breachNote(d) }}</div>
           </div>
@@ -140,12 +142,12 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
         <div class="grid">
           <div class="tile">
             <div class="k">Deposits held</div>
-            <div class="v">₹{{ d.depositsHeld | number:'1.0-0' }}</div>
+            <div class="v">{{ d.depositsHeld | rupees }}</div>
             <div class="n">Customer money the platform is holding against containers in the wild. This is a liability, not revenue.</div>
           </div>
           <div class="tile">
             <div class="k">Forfeited this week</div>
-            <div class="v" [class.warn]="d.depositsForfeitedThisWeek > 0">₹{{ d.depositsForfeitedThisWeek | number:'1.0-0' }}</div>
+            <div class="v" [class.warn]="d.depositsForfeitedThisWeek > 0">{{ d.depositsForfeitedThisWeek | rupees }}</div>
             <div class="n">{{ forfeitNote(d) }}</div>
           </div>
         </div>
@@ -173,7 +175,7 @@ export class AnalyticsComponent {
   readonly aov = computed(() => {
     const d = this.data();
     if (!d || d.ordersToday === 0) return '—';
-    return `₹${Math.round(Number(d.grossRevenueToday) / d.ordersToday).toLocaleString('en-IN')}`;
+    return formatRupees(Math.round(Number(d.grossRevenueToday) / d.ordersToday));
   });
 
   breachNote(d: AdminAnalyticsSummary): string {

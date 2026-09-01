@@ -1,11 +1,16 @@
 import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { ApiClient } from '../../core/api/api-client';
-import { describeError } from '../../shared/api-error';
+import { RouterLink } from '@angular/router';
+import { forkJoin } from 'rxjs';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { DirectoryService } from '../../shared/directory.service';
+import { label as enumLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
-import { formatDuration, humanize, msSince } from '../../shared/ui/urgency';
+import { ToastService } from '../../shared/ui/toast.service';
+import { formatDuration, msSince } from '../../shared/ui/urgency';
 
 type Channel = 'PUSH' | 'SMS' | 'EMAIL' | 'IN_APP';
 type Status = 'QUEUED' | 'SENT' | 'DELIVERED' | 'READ' | 'FAILED' | 'BOUNCED';
@@ -39,7 +44,7 @@ interface AdminNotification {
 @Component({
   selector: 'app-notifications',
   standalone: true,
-  imports: [CommonModule, PageHeaderComponent, DataStateComponent],
+  imports: [CommonModule, RouterLink, PageHeaderComponent, DataStateComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
@@ -57,7 +62,10 @@ interface AdminNotification {
     .meta { display: flex; align-items: center; gap: 6px; margin-top: 9px; flex-wrap: wrap; }
     .fail { font-size: 12px; color: var(--err-ink); font-weight: 600; margin-top: 6px; }
 
-    .summary { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .summary { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+    .row-actions { display: flex; gap: 8px; align-items: center; margin-top: 9px; flex-wrap: wrap; }
+    .row.read { opacity: .68; }
+    .err-line { color: var(--err-ink); font-size: 12.5px; font-weight: 600; margin-bottom: 12px; }
   `],
   template: `
     <app-page-header
@@ -72,9 +80,16 @@ interface AdminNotification {
       <div class="summary">
         <span class="pill pill--brand">{{ unreadCount() }} unread</span>
         @if (failedCount() > 0) { <span class="pill pill--crit">{{ failedCount() }} never delivered</span> }
-        <span class="pill pill--mute">{{ items().length }} in the last 50</span>
+        <span class="pill pill--mute">{{ items().length }} most recent</span>
+        @if (unreadCount() > 0) {
+          <button type="button" class="btn btn--ghost btn--sm" (click)="markAllRead()" [disabled]="busy()">
+            {{ busy() ? 'Marking…' : 'Mark all ' + unreadCount() + ' read' }}
+          </button>
+        }
       </div>
     }
+
+    @if (actionError(); as e) { <div class="err-line" role="alert">{{ e }}</div> }
 
     @if (loading() || error() || rows().length === 0) {
       <div class="panel">
@@ -90,6 +105,7 @@ interface AdminNotification {
       <div class="feed">
         @for (n of rows(); track n.id) {
           <div class="row" [class.unread]="n.status !== 'READ'"
+               [class.read]="n.status === 'READ'"
                [class.failed]="n.status === 'FAILED' || n.status === 'BOUNCED'">
             <div class="head">
               <span class="subject">{{ n.subject ?? label(n.category) }}</span>
@@ -101,7 +117,7 @@ interface AdminNotification {
                     [class.pill--info]="n.channel === 'PUSH'"
                     [class.pill--brand]="n.channel === 'EMAIL'"
                     [class.pill--vend]="n.channel === 'SMS'"
-                    [class.pill--mute]="n.channel === 'IN_APP'">{{ n.channel }}</span>
+                    [class.pill--mute]="n.channel === 'IN_APP'">{{ label(n.channel) }}</span>
               <span class="pill"
                     [class.pill--ok]="n.status === 'DELIVERED' || n.status === 'READ'"
                     [class.pill--warn]="n.status === 'QUEUED' || n.status === 'SENT'"
@@ -109,6 +125,23 @@ interface AdminNotification {
               <span class="pill pill--outline">{{ label(n.category) }}</span>
             </div>
             @if (n.failureReason) { <div class="fail">Delivery failed — {{ n.failureReason }}</div> }
+
+            <!-- The feed was a dead screen: 25 identical alerts, no way to clear
+                 one, and no route to the thing each was about. Both now exist. -->
+            <div class="row-actions">
+              @if (orderNumberOf(n); as num) {
+                <a class="btn btn--ghost btn--sm" routerLink="/orders" [queryParams]="{ view: 'all' }"
+                   [title]="'Open the order board and find ' + num">Go to {{ num }}</a>
+              }
+              @if (n.status !== 'READ') {
+                <button type="button" class="btn btn--ghost btn--sm" (click)="markRead(n)"
+                        [disabled]="busyId() === n.id">
+                  {{ busyId() === n.id ? 'Marking…' : 'Mark read' }}
+                </button>
+              } @else {
+                <span class="text-meta">Read</span>
+              }
+            </div>
           </div>
         }
       </div>
@@ -118,14 +151,68 @@ interface AdminNotification {
 export class NotificationsComponent {
   private api = inject(ApiClient);
   private clock = inject(ClockService);
+  private toasts = inject(ToastService);
+  private directory = inject(DirectoryService);
 
   loading = signal(true);
   error = signal<string | null>(null);
+  actionError = signal<string | null>(null);
+  busyId = signal<string | null>(null);
+  busy = signal(false);
   items = signal<AdminNotification[]>([]);
 
-  constructor() { this.reload(); }
+  constructor() {
+    this.reload();
+    // Alerts carry an `orderId` in their payload but no order number, and a
+    // UUID is not a link anyone can follow.
+    this.directory.ensureLoaded();
+  }
 
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
+
+  /** The `NEE-…` number for the order this alert is about, when resolvable. */
+  orderNumberOf(n: AdminNotification): string | null {
+    const id = n.payload?.['orderId'];
+    return typeof id === 'string' ? this.directory.orderNumber(id) : null;
+  }
+
+  markRead(n: AdminNotification) {
+    this.busyId.set(n.id);
+    this.actionError.set(null);
+    this.api.post(`/notifications/${n.id}/read`).subscribe({
+      next: () => {
+        this.busyId.set(null);
+        this.applyRead([n.id]);
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'marking this alert read')); this.busyId.set(null); }
+    });
+  }
+
+  markAllRead() {
+    const unread = this.items().filter(n => n.status !== 'READ');
+    if (!unread.length) return;
+    this.busy.set(true);
+    this.actionError.set(null);
+    forkJoin(unread.map(n => this.api.post(`/notifications/${n.id}/read`))).subscribe({
+      next: () => {
+        this.busy.set(false);
+        this.applyRead(unread.map(n => n.id));
+        this.toasts.success(
+          `${unread.length} alert${unread.length === 1 ? '' : 's'} marked read`,
+          'Cleared from your unread count. Nothing was deleted — the history stays.'
+        );
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'marking these alerts read')); this.busy.set(false); }
+    });
+  }
+
+  /** Local state moves with the server rather than re-fetching fifty rows. */
+  private applyRead(ids: string[]) {
+    const set = new Set(ids);
+    const now = new Date().toISOString();
+    this.items.update(list => list.map(n =>
+      set.has(n.id) ? { ...n, status: 'READ' as Status, readAt: n.readAt ?? now } : n));
+  }
   ago(iso: string) {
     const ms = msSince(iso, this.clock.now());
     return ms === null ? '' : `${formatDuration(ms)} ago`;

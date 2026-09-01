@@ -1,4 +1,6 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClientTesting } from '@angular/common/http/testing';
 import { of } from 'rxjs';
 import { SurgeComponent } from './surge.component';
 import { SurgeService } from './surge.service';
@@ -33,7 +35,13 @@ describe('SurgeComponent', () => {
 
     await TestBed.configureTestingModule({
       imports: [SurgeComponent],
-      providers: [{ provide: SurgeService, useValue: service }]
+      providers: [
+        { provide: SurgeService, useValue: service },
+        // Creating or cancelling a surge refreshes the shared attention read
+        // model so the overview stops disagreeing about whether surge is on.
+        provideHttpClient(),
+        provideHttpClientTesting()
+      ]
     }).compileComponents();
 
     fixture = TestBed.createComponent(SurgeComponent);

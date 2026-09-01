@@ -3,9 +3,16 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { PricingService } from './pricing.service';
 import type { PriceBandResponse } from './price-band.model';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { PRODUCT_CATEGORY_CODES, label as enumLabel } from '../../shared/labels';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { formatRupees } from '../../shared/ui/format';
+import { RupeesPipe, WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
+import {
+  ConfirmDialogComponent, ConfirmRequest, ConfirmResult
+} from '../../shared/ui/confirm-dialog.component';
 
 /**
  * Price bands.
@@ -19,7 +26,10 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
 @Component({
   selector: 'app-price-bands',
   standalone: true,
-  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent],
+  imports: [
+    CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent,
+    WhenPipe, RupeesPipe
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
@@ -53,7 +63,7 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
       <div class="panel">
         <div class="panel-head">
           <h2>Bands in force</h2>
-          <span class="text-label">{{ bands().length }} active</span>
+          <span class="text-label">{{ loading() ? 'still counting…' : bands().length + ' active' }}</span>
         </div>
 
         @if (loading() || error() || bands().length === 0) {
@@ -77,19 +87,22 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
               <tbody>
                 @for (b of bands(); track b.id) {
                   <tr>
-                    <td class="mono primary-cell">{{ b.categoryCode }}</td>
+                    <td class="primary-cell">
+                      {{ categoryLabel(b.categoryCode) }}
+                      <div class="sub-cell mono">{{ b.categoryCode }}</div>
+                    </td>
                     <td>{{ b.city }}</td>
-                    <td class="right"><span class="price">₹{{ b.minPrice }}</span></td>
-                    <td class="right"><span class="price">₹{{ b.maxPrice }}</span></td>
+                    <td class="right"><span class="price">{{ b.minPrice | rupees }}</span></td>
+                    <td class="right"><span class="price">{{ b.maxPrice | rupees }}</span></td>
                     <td>
                       <span class="range">
                         <span class="bar"><i [style.left.%]="offset(b)" [style.width.%]="width(b)"></i></span>
-                        <span class="w">₹{{ b.maxPrice - b.minPrice }} wide</span>
+                        <span class="w">{{ b.maxPrice - b.minPrice | rupees }} wide</span>
                       </span>
                     </td>
                     <td>
-                      {{ b.effectiveFrom | date:'d MMM y' }}
-                      @if (b.effectiveTo) { <div class="sub-cell">until {{ b.effectiveTo | date:'d MMM y' }}</div> }
+                      {{ b.effectiveFrom | when:'date' }}
+                      @if (b.effectiveTo) { <div class="sub-cell">until {{ b.effectiveTo | when:'date' }}</div> }
                     </td>
                   </tr>
                 }
@@ -107,8 +120,14 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
             opens this one from now. Existing orders keep the price they were quoted.
           </p>
 
-          <label class="field-label" for="pb-cat">Category code</label>
-          <input id="pb-cat" class="input mono" [(ngModel)]="form.categoryCode" placeholder="JAR_20L_NORMAL" />
+          <!-- Typed free-text silently created a band against a category that
+               does not exist. The list is the platform's own catalog, plus any
+               code an existing band already uses. -->
+          <label class="field-label" for="pb-cat">Category</label>
+          <select id="pb-cat" class="input" [(ngModel)]="form.categoryCode">
+            <option value="" disabled>Choose a category…</option>
+            @for (c of categoryOptions(); track c) { <option [value]="c">{{ categoryLabel(c) }}</option> }
+          </select>
 
           <label class="field-label mt-12" for="pb-city">City</label>
           <input id="pb-city" class="input" [(ngModel)]="form.city" placeholder="Hyderabad" />
@@ -128,8 +147,11 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
             <div class="err">Maximum has to be at least the minimum.</div>
           }
 
+          <!-- This changes what every vendor in the city may charge for a whole
+               category. It saved on one click while cancelling a single ₹385
+               order demanded a typed reason. -->
           <button type="button" class="btn btn--primary primary mt-16" style="width:100%;"
-                  [disabled]="!valid() || saving()" (click)="save()">
+                  [disabled]="!valid() || saving()" (click)="askSave()">
             {{ saving() ? 'Saving…' : 'Save band' }}
           </button>
 
@@ -137,10 +159,17 @@ import { PageHeaderComponent } from '../../shared/ui/page-header.component';
         </div>
       </div>
     </div>
+
+    <app-confirm-dialog [request]="confirm()" [busy]="saving()"
+                        (confirmed)="runConfirmed($event)" (cancelled)="confirm.set(null)" />
   `
 })
 export class PriceBandsComponent {
   private service = inject(PricingService);
+  private toasts = inject(ToastService);
+
+  confirm = signal<ConfirmRequest | null>(null);
+  private pending: (() => void) | null = null;
 
   bands = signal<PriceBandResponse[]>([]);
   loading = signal(true);
@@ -154,6 +183,44 @@ export class PriceBandsComponent {
   valid() {
     return this.form.categoryCode.trim() && this.form.city.trim()
       && this.form.minPrice > 0 && this.form.maxPrice >= this.form.minPrice;
+  }
+
+  categoryLabel(code: string) { return enumLabel(code); }
+
+  /**
+   * The catalog's categories plus any code already carrying a band.
+   *
+   * The admin token cannot read `/vendor/catalog/templates` (it is vendor-role
+   * gated), so the canonical list is mirrored in `labels.ts`; merging in the
+   * codes actually in use means a category added on the backend still appears
+   * here as soon as anything references it.
+   */
+  readonly categoryOptions = computed(() => {
+    const inUse = this.bands().map(b => b.categoryCode);
+    return [...new Set([...PRODUCT_CATEGORY_CODES, ...inUse])];
+  });
+
+  askSave() {
+    if (!this.valid()) return;
+    const f = this.form;
+    const existing = this.bands().find(b => b.categoryCode === f.categoryCode && b.city === f.city);
+    this.confirm.set({
+      title: `Set the ${enumLabel(f.categoryCode)} band`,
+      message: `Every vendor in ${f.city} will be held to ${formatRupees(f.minPrice)}–${formatRupees(f.maxPrice)} for this category.`,
+      confirmLabel: 'Put this band in force',
+      tone: 'primary',
+      consequence: existing
+        ? `This closes the current ${formatRupees(existing.minPrice)}–${formatRupees(existing.maxPrice)} band and opens the new one from now. Orders already placed keep the price they were quoted.`
+        : 'No band exists for this pair yet, so nothing currently constrains what vendors charge for it.'
+    });
+    this.pending = () => this.save();
+  }
+
+  runConfirmed(_result: ConfirmResult) {
+    const run = this.pending;
+    this.confirm.set(null);
+    this.pending = null;
+    run?.();
   }
 
   /** Widest ceiling across all bands, so every spread bar shares one scale. */
@@ -181,13 +248,18 @@ export class PriceBandsComponent {
   save() {
     this.saving.set(true);
     this.saveError.set(null);
-    this.service.upsert({ ...this.form }).subscribe({
+    const saved = { ...this.form };
+    this.service.upsert(saved).subscribe({
       next: () => {
         this.form = { categoryCode: '', city: 'Hyderabad', minPrice: 0, maxPrice: 0 };
         this.saving.set(false);
+        this.toasts.success(
+          `${enumLabel(saved.categoryCode)} band in force`,
+          `${formatRupees(saved.minPrice)}–${formatRupees(saved.maxPrice)} in ${saved.city}, from now. Existing orders keep their quoted price.`
+        );
         this.reload();
       },
-      error: e => { this.saveError.set(describeError(e, 'the band')); this.saving.set(false); }
+      error: e => { this.saveError.set(describeActionError(e, 'saving this price band')); this.saving.set(false); }
     });
   }
 }

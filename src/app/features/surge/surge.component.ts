@@ -3,14 +3,18 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { SurgeService } from './surge.service';
 import type { CreateSurgeRequest, SurgeTrigger, TriggerSource } from './surge.model';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { PRODUCT_CATEGORY_CODES, label as enumLabel } from '../../shared/labels';
+import { AttentionService } from '../../shared/attention.service';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
   ConfirmDialogComponent, ConfirmRequest, ConfirmResult
 } from '../../shared/ui/confirm-dialog.component';
-import { formatDuration, humanize, msSince, msUntil } from '../../shared/ui/urgency';
+import { formatDuration, msSince, msUntil } from '../../shared/ui/urgency';
 
 interface SurgeRow {
   trigger: SurgeTrigger;
@@ -31,7 +35,7 @@ interface SurgeRow {
 @Component({
   selector: 'app-surge',
   standalone: true,
-  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
+  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent, WhenPipe],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
@@ -89,8 +93,11 @@ interface SurgeRow {
           <input id="sg-pin" class="input mono" [(ngModel)]="form.pincode" maxlength="6" placeholder="all" />
         </div>
         <div>
-          <label class="field-label" for="sg-cat">Category (optional)</label>
-          <input id="sg-cat" class="input mono" [(ngModel)]="form.categoryCode" placeholder="all" />
+          <label class="field-label" for="sg-cat">Category</label>
+          <select id="sg-cat" class="input" [(ngModel)]="form.categoryCode">
+            <option value="">Every category</option>
+            @for (c of categories; track c) { <option [value]="c">{{ label(c) }}</option> }
+          </select>
         </div>
         <div>
           <label class="field-label" for="sg-mult">Multiplier</label>
@@ -117,7 +124,7 @@ interface SurgeRow {
     <div class="panel mt-12">
       <div class="panel-head">
         <h2>Surge history</h2>
-        <span class="text-label">{{ rows().length }} triggers</span>
+        <span class="text-label">{{ loading() ? 'still counting…' : rows().length + ' triggers' }}</span>
       </div>
 
       @if (loading() || error() || rows().length === 0) {
@@ -149,12 +156,12 @@ interface SurgeRow {
                     <div class="primary-cell">{{ r.trigger.city }}</div>
                     <div class="sub-cell">
                       {{ r.trigger.pincode ? r.trigger.pincode : 'all pincodes' }} ·
-                      {{ r.trigger.categoryCode ? r.trigger.categoryCode : 'all categories' }}
+                      {{ r.trigger.categoryCode ? label(r.trigger.categoryCode) : 'all categories' }}
                     </div>
                   </td>
                   <td class="muted" style="max-width:30ch;font-size:12.5px;">{{ r.trigger.reason ?? '—' }}</td>
                   <td>
-                    <div>{{ r.trigger.activeFrom | date:'d MMM, HH:mm' }}</div>
+                    <div>{{ r.trigger.activeFrom | when }}</div>
                     <div class="sub-cell">{{ r.window }}</div>
                   </td>
                   <td><span class="pill pill--outline">{{ label(r.trigger.source) }}</span></td>
@@ -176,16 +183,31 @@ interface SurgeRow {
       }
     </div>
 
+    @if (actionError(); as e) {
+      <div class="lede crit mt-16" role="alert">
+        {{ e }}
+        <button type="button" class="btn btn--ghost btn--sm" style="margin-left:10px;"
+                (click)="actionError.set(null)">Dismiss</button>
+      </div>
+    }
+
     <app-confirm-dialog [request]="confirm()" (confirmed)="runConfirmed($event)" (cancelled)="confirm.set(null)" />
   `
 })
 export class SurgeComponent {
   private service = inject(SurgeService);
   private clock = inject(ClockService);
+  private toasts = inject(ToastService);
+  private attention = inject(AttentionService);
+
+  categories = PRODUCT_CATEGORY_CODES;
 
   loading = signal(true);
+  /** A failed *load*: the history is empty. */
   error = signal<string | null>(null);
   createError = signal<string | null>(null);
+  /** A failed *action*: the history is fine, the cancellation is not. */
+  actionError = signal<string | null>(null);
   items = signal<SurgeTrigger[]>([]);
   filterCity = 'Hyderabad';
 
@@ -203,7 +225,7 @@ export class SurgeComponent {
 
   constructor() { this.reload(); }
 
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
 
   formValid(): boolean {
     return !!this.form.city.trim() && this.form.multiplier >= 1 && this.form.multiplier <= 1.5;
@@ -305,15 +327,32 @@ export class SurgeComponent {
       source,
       reason: reason || undefined
     }).subscribe({
-      next: () => this.reload(),
-      error: e => this.createError.set(describeError(e, 'the surge trigger'))
+      next: () => {
+        this.toasts.success(
+          `${multiplier.toFixed(2)}× surge is live in ${city}`,
+          `Every order placed in ${pincode || 'any pincode'}${categoryCode ? ` for ${enumLabel(categoryCode)}` : ''} now carries the surcharge. Cancel it from the row below.`
+        );
+        this.reload();
+        // The overview reads the trigger list to answer "is surge on".
+        this.attention.refresh();
+      },
+      error: e => this.createError.set(describeActionError(e, 'triggering this surge'))
     });
   }
 
   cancel(s: SurgeTrigger) {
+    this.actionError.set(null);
     this.service.cancel(s.id).subscribe({
-      next: () => this.reload(),
-      error: e => this.error.set(describeError(e, 'the cancellation'))
+      next: () => {
+        this.toasts.success(
+          `${Number(s.multiplier).toFixed(2)}× surge stopped in ${s.city}`,
+          'Orders placed from now pay list price. Orders already placed keep the price they were quoted.'
+        );
+        this.reload();
+        this.attention.refresh();
+      },
+      // A refused cancellation must not replace the history it was launched from.
+      error: e => this.actionError.set(describeActionError(e, 'cancelling this surge'))
     });
   }
 }

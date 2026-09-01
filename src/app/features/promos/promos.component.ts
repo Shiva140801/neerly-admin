@@ -3,14 +3,18 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { PromoService } from './promo.service';
 import type { CreatePromoRequest, DiscountType, Promo, PromoEligibility } from './promo.model';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { label as enumLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { formatRupees } from '../../shared/ui/format';
+import { RupeesPipe, WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
   ConfirmDialogComponent, ConfirmRequest, ConfirmResult
 } from '../../shared/ui/confirm-dialog.component';
-import { Severity, daysUntilDate, formatDuration, humanize, msUntil } from '../../shared/ui/urgency';
+import { Severity, daysUntilDate, formatDuration, msUntil } from '../../shared/ui/urgency';
 
 interface PromoRow {
   promo: Promo;
@@ -20,6 +24,32 @@ interface PromoRow {
   usedPct: number | null;
   severity: Severity;
   note: string;
+  /** What the redemptions so far have cost, said in rupees. */
+  spend: string;
+  /** Rupees given back, or null when the payload cannot pin it down exactly. */
+  spendExact: number | null;
+}
+
+/**
+ * What a promo has actually cost so far.
+ *
+ * A FLAT code gives exactly its face value away on every redemption, so the
+ * spend is arithmetic the portal can do honestly. A PERCENT code depends on the
+ * order values it was applied to, which this payload does not carry — so the
+ * ceiling is quoted when there is a cap, and otherwise the screen says plainly
+ * that the rupees are not knowable from here rather than inventing a number.
+ */
+function spendOf(p: Promo): { label: string; exact: number | null } {
+  const used = Number(p.currentRedemptions ?? 0);
+  if (used === 0) return { label: 'nothing given back yet', exact: 0 };
+  if (p.discountType === 'FLAT') {
+    const spent = used * Number(p.discountValue ?? 0);
+    return { label: `${formatRupees(spent)} given back`, exact: spent };
+  }
+  if (p.maxDiscount) {
+    return { label: `up to ${formatRupees(used * Number(p.maxDiscount))} given back`, exact: null };
+  }
+  return { label: `${p.discountValue}% of each order — rupees depend on basket size`, exact: null };
 }
 
 /**
@@ -34,7 +64,10 @@ interface PromoRow {
 @Component({
   selector: 'app-promos',
   standalone: true,
-  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
+  imports: [
+    CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent,
+    WhenPipe, RupeesPipe
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
@@ -132,7 +165,10 @@ interface PromoRow {
     <div class="panel mt-24">
       <div class="panel-head">
         <h2>Catalog</h2>
-        <span class="text-label">{{ liveCount() }} live of {{ rows().length }}</span>
+        <span class="text-label">
+          @if (loading()) { still counting… }
+          @else { {{ liveCount() }} live of {{ rows().length }} · {{ totalSpendLabel() }} given back }
+        </span>
       </div>
 
       @if (loading() || error() || rows().length === 0) {
@@ -149,7 +185,7 @@ interface PromoRow {
             <thead>
               <tr>
                 <th>Code</th><th>Discount</th><th class="right">Min order</th>
-                <th>Who</th><th>Burn</th><th>Runs until</th><th>Status</th><th class="right"></th>
+                <th>Who</th><th>Redeemed · cost so far</th><th>Runs until</th><th>Status</th><th class="right"></th>
               </tr>
             </thead>
             <tbody>
@@ -161,17 +197,20 @@ interface PromoRow {
                   </td>
                   <td>
                     <span class="discount">
-                      @if (r.promo.discountType === 'FLAT') { ₹{{ r.promo.discountValue }} }
-                      @else { {{ r.promo.discountValue }}% }
+                      @if (r.promo.discountType === 'FLAT') { {{ r.promo.discountValue | rupees }} off }
+                      @else { {{ r.promo.discountValue }}% off }
                     </span>
-                    @if (r.promo.maxDiscount) { <div class="sub-cell">capped at ₹{{ r.promo.maxDiscount }}</div> }
+                    @if (r.promo.maxDiscount) { <div class="sub-cell">capped at {{ r.promo.maxDiscount | rupees }}</div> }
                   </td>
-                  <td class="right num">₹{{ r.promo.minOrderValue }}</td>
+                  <td class="right num">{{ r.promo.minOrderValue | rupees }}</td>
                   <td>
                     <span class="pill pill--outline">{{ label(r.promo.eligibility) }}</span>
                     <div class="sub-cell">{{ r.promo.maxPerCustomer }} per customer</div>
                   </td>
                   <td>
+                    <!-- "BURN 10 / 100" had no unit and never named the money.
+                         The redemption count keeps its cap bar; underneath it now
+                         says what those redemptions have actually cost. -->
                     <span class="burn">
                       @if (r.usedPct !== null) {
                         <span class="bar">
@@ -179,15 +218,16 @@ interface PromoRow {
                              [class.warn]="r.usedPct >= 70 && r.usedPct < 90"
                              [class.crit]="r.usedPct >= 90"></i>
                         </span>
-                        <span class="n">{{ r.promo.currentRedemptions }} / {{ r.promo.maxRedemptions }}</span>
+                        <span class="n">{{ r.promo.currentRedemptions }} of {{ r.promo.maxRedemptions }} uses</span>
                       } @else {
-                        <span class="n">{{ r.promo.currentRedemptions }}</span>
-                        <span class="muted" style="font-size:11.5px;">uncapped</span>
+                        <span class="n">{{ r.promo.currentRedemptions }} use{{ r.promo.currentRedemptions === 1 ? '' : 's' }}</span>
+                        <span class="muted" style="font-size:11.5px;">no cap</span>
                       }
                     </span>
+                    <div class="sub-cell">{{ r.spend }}</div>
                   </td>
                   <td>
-                    <div>{{ r.promo.validUntil | date:'d MMM y' }}</div>
+                    <div>{{ r.promo.validUntil | when:'date' }}</div>
                     <div class="sub-cell">{{ r.note }}</div>
                   </td>
                   <td>
@@ -208,16 +248,28 @@ interface PromoRow {
       }
     </div>
 
+    @if (actionError(); as e) {
+      <div class="lede crit mt-16" role="alert">
+        {{ e }}
+        <button type="button" class="btn btn--ghost btn--sm" style="margin-left:10px;"
+                (click)="actionError.set(null)">Dismiss</button>
+      </div>
+    }
+
     <app-confirm-dialog [request]="confirm()" (confirmed)="runConfirmed($event)" (cancelled)="confirm.set(null)" />
   `
 })
 export class PromosComponent {
   private service = inject(PromoService);
   private clock = inject(ClockService);
+  private toasts = inject(ToastService);
 
   loading = signal(true);
+  /** A failed *load*. The catalog has nothing to show. */
   error = signal<string | null>(null);
   createError = signal<string | null>(null);
+  /** A failed *action*. The catalog is fine; the retirement is not. */
+  actionError = signal<string | null>(null);
   items = signal<Promo[]>([]);
 
   confirm = signal<ConfirmRequest | null>(null);
@@ -242,7 +294,7 @@ export class PromosComponent {
 
   constructor() { this.reload(); }
 
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
 
   formReady(): boolean {
     return !!this.form.code.trim() && !!this.form.validFromLocal && !!this.form.validUntilLocal;
@@ -260,6 +312,7 @@ export class PromosComponent {
           ? Math.min(100, Math.round((promo.currentRedemptions / promo.maxRedemptions) * 100))
           : null;
 
+        const spend = spendOf(promo);
         let severity: Severity = 'ok';
         let note: string;
         if (!promo.isActive) { severity = 'idle'; note = 'retired'; }
@@ -269,13 +322,27 @@ export class PromosComponent {
         else if ((daysLeft ?? 99) <= 3) { severity = 'warn'; note = `${daysLeft}d left to run`; }
         else { note = `${formatDuration(remaining ?? 0)} left to run`; }
 
-        return { promo, live, daysLeft, usedPct, severity, note };
+        return { promo, live, daysLeft, usedPct, severity, note, spend: spend.label, spendExact: spend.exact };
       })
       .sort((a, b) => Number(b.live) - Number(a.live) ||
         Date.parse(b.promo.createdAt) - Date.parse(a.promo.createdAt));
   });
 
   readonly liveCount = computed(() => this.rows().filter(r => r.live).length);
+
+  /**
+   * Total margin given back across the catalog. Only the codes whose cost is
+   * exactly knowable are summed; the rest are counted separately so the figure
+   * is never quietly understated.
+   */
+  readonly totalSpendLabel = computed(() => {
+    const rows = this.rows();
+    const known = rows.filter(r => r.spendExact !== null);
+    const total = known.reduce((s, r) => s + (r.spendExact ?? 0), 0);
+    const unknown = rows.length - known.length;
+    const base = formatRupees(total);
+    return unknown > 0 ? `${base}+ across ${known.length} of ${rows.length} codes` : base;
+  });
 
   reload() {
     this.loading.set(true);
@@ -292,22 +359,33 @@ export class PromosComponent {
       ? `₹${this.form.discountValue}` : `${this.form.discountValue}%`;
     this.confirm.set({
       title: `Publish ${this.form.code.toUpperCase()}`,
-      message: `${value} off orders over ₹${this.form.minOrderValue}, ${humanize(this.form.eligibility)}.`,
+      message: `${value} off orders over ${formatRupees(this.form.minOrderValue)}, ${enumLabel(this.form.eligibility).toLowerCase()}.`,
       confirmLabel: 'Create promo',
       tone: 'primary',
       consequence: this.form.maxRedemptions
-        ? `Capped at ${this.form.maxRedemptions} total redemptions — the platform absorbs the discount out of margin.`
+        ? `Worst case ${formatRupees(this.maxExposure())} out of platform margin, at ${this.form.maxRedemptions} redemptions.`
         : 'No global cap set. Every redemption comes out of platform margin with nothing to stop it.'
     });
     this.pending = () => this.create();
   }
 
+  /** Ceiling on what a capped promo can cost, where the maths is exact. */
+  private maxExposure(): number {
+    const cap = Number(this.form.maxRedemptions ?? 0);
+    const per = this.form.discountType === 'FLAT'
+      ? Number(this.form.discountValue ?? 0)
+      : Number(this.form.maxDiscount ?? 0);
+    return cap * per;
+  }
+
   askDeactivate(p: Promo) {
+    const spend = spendOf(p);
     this.confirm.set({
       title: `Retire ${p.code}`,
-      message: `The code stops working immediately. ${p.currentRedemptions} redemption${p.currentRedemptions === 1 ? '' : 's'} already granted are unaffected.`,
+      message: `The code stops working immediately. The ${p.currentRedemptions} redemption${p.currentRedemptions === 1 ? '' : 's'} already granted — ${spend.label} — are unaffected.`,
       confirmLabel: 'Retire promo',
-      tone: 'danger'
+      tone: 'danger',
+      cancelLabel: 'Leave it running'
     });
     this.pending = () => this.deactivate(p);
   }
@@ -337,19 +415,34 @@ export class PromosComponent {
     };
     this.createError.set(null);
     this.service.create(body).subscribe({
-      next: () => {
+      next: created => {
+        const code = created?.code ?? body.code;
         this.form.code = '';
         this.form.description = '';
+        this.toasts.success(
+          `${code} is published`,
+          body.maxRedemptions
+            ? `Capped at ${body.maxRedemptions} redemptions. Watch the burn column — the platform pays this out of margin.`
+            : 'Uncapped. Every redemption comes out of platform margin with nothing to stop it.'
+        );
         this.reload();
       },
-      error: e => this.createError.set(describeError(e, 'the promo'))
+      error: e => this.createError.set(describeActionError(e, 'creating this promo'))
     });
   }
 
   deactivate(p: Promo) {
+    this.actionError.set(null);
     this.service.deactivate(p.id).subscribe({
-      next: () => this.reload(),
-      error: e => this.error.set(describeError(e, 'the retirement'))
+      next: () => {
+        this.toasts.success(
+          `${p.code} retired`,
+          `The code stops working from now. ${spendOf(p).label} — already granted and unaffected.`
+        );
+        this.reload();
+      },
+      // A refused retirement must not wipe the catalog it was launched from.
+      error: e => this.actionError.set(describeActionError(e, 'retiring this promo'))
     });
   }
 }
