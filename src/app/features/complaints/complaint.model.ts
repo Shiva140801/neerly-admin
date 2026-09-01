@@ -25,6 +25,15 @@ export interface Complaint {
   customerId: string;
   vendorId: string | null;
   orderId: string | null;
+  /**
+   * Resolved display details, joined server-side. All optional and nullable:
+   * a ticket that names no vendor has no vendor name, and an unnamed party is
+   * shown as an unresolved id rather than invented.
+   */
+  customerName?: string | null;
+  customerPhone?: string | null;
+  vendorName?: string | null;
+  orderNumber?: string | null;
   category: ComplaintCategory;
   subject: string;
   description: string;

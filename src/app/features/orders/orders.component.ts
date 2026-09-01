@@ -4,14 +4,40 @@ import { FormsModule } from '@angular/forms';
 import { ActivatedRoute } from '@angular/router';
 import { ApiClient } from '../../core/api/api-client';
 import { AdminOrder, TERMINAL_ORDER_STATUSES, isStuck, isUnrouted } from '../../shared/attention.service';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { label as enumLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { RupeesPipe, WhenPipe } from '../../shared/ui/format.pipe';
+import { formatRupees } from '../../shared/ui/format';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
   ConfirmDialogComponent, ConfirmRequest, ConfirmResult
 } from '../../shared/ui/confirm-dialog.component';
-import { Severity, formatDuration, humanize, msSince, msUntil } from '../../shared/ui/urgency';
+import { Severity, formatDuration, msSince, msUntil } from '../../shared/ui/urgency';
+
+/**
+ * The states an admin cancel is actually allowed from.
+ *
+ * Mirrors `OrderStatus.ALLOWED` on the backend: once a driver has the order
+ * (DISPATCHED, ARRIVING) the only exits are DELIVERED and FAILED, so offering
+ * Cancel there asks the operator to type a mandatory audited reason and *then*
+ * tells them it was never possible.
+ */
+const CANCELLABLE = new Set(['PLACED', 'VENDOR_ASSIGNED', 'VENDOR_ACCEPTED', 'PREPARING']);
+
+/** Why Cancel is unavailable, for the tooltip on the disabled control. */
+function cancelBlockedReason(status: string): string {
+  if (TERMINAL_ORDER_STATUSES.has(status)) return `Already ${enumLabel(status).toLowerCase()} — nothing left to cancel.`;
+  if (status === 'DISPATCHED' || status === 'ARRIVING') {
+    return 'A driver is already carrying this order. It can only be delivered or marked failed from here.';
+  }
+  if (status === 'VENDOR_REJECTED') {
+    return 'The vendor declined this one — reroute it to another vendor, or let it fail.';
+  }
+  return 'The backend does not allow a cancellation from this stage.';
+}
 
 /** Lifecycle stages, in the order the backend allows them to move. */
 const PIPELINE: string[] = [
@@ -20,6 +46,26 @@ const PIPELINE: string[] = [
 ];
 
 type View = 'attention' | 'live' | 'all' | string;
+
+/**
+ * How close two failures have to be to count as the same incident, and how many
+ * it takes before the board treats them as one. Ten minutes is well outside the
+ * three-minute vendor accept window, so a routing outage lands in one cluster
+ * while two unrelated failures on the same afternoon stay separate rows.
+ */
+const INCIDENT_WINDOW_MS = 10 * 60_000;
+const INCIDENT_MIN_SIZE = 3;
+
+/** A run of failures that happened together — one problem, many orders. */
+interface Incident {
+  id: string;
+  orders: AdminOrder[];
+  firstAt: string;
+  /** "under a minute" / "3h 12m" — how long the run lasted. */
+  spanLabel: string;
+  /** "All against Sri Ganesh Water Supply." */
+  vendorLabel: string;
+}
 
 interface OrderRow {
   order: AdminOrder;
@@ -49,19 +95,15 @@ interface OrderRow {
 @Component({
   selector: 'app-orders-admin',
   standalone: true,
-  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
+  imports: [
+    CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent,
+    WhenPipe, RupeesPipe
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
-    .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
     .toolbar .vendor-filter { width: 260px; }
 
-    .lede {
-      padding: 12px 16px; border-radius: var(--r-md); margin-bottom: 16px;
-      font-size: 13px; line-height: 1.5; font-weight: 600;
-    }
-    .lede.crit { background: var(--err-soft); color: var(--err-ink); }
-    .lede.ok   { background: var(--ok-soft);  color: var(--ok-ink); }
 
     .clock { font-weight: 750; font-variant-numeric: tabular-nums; font-size: 13.5px; }
     .clock.crit { color: var(--err); }
@@ -78,6 +120,34 @@ interface OrderRow {
     .track i.bad  { background: var(--err); }
 
     .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+    .row-actions .btn:disabled { cursor: not-allowed; }
+
+    .action-error {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 12px 16px; border-radius: var(--r-md); margin-bottom: 16px;
+      background: var(--err-soft); color: var(--err-ink);
+      font-size: 13px; font-weight: 600; line-height: 1.5;
+    }
+    .action-error .btn { margin-left: auto; flex: none; }
+
+    .search { width: 260px; }
+    .toolbar .find { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+    .toolbar select.vendor-pick { width: 190px; }
+
+    .incident {
+      display: grid; grid-template-columns: 58px 1fr auto; gap: 14px; align-items: center;
+      padding: 13px 16px; background: var(--ink-50);
+      border-bottom: 1px solid var(--ink-200);
+    }
+    .incident .n { font-size: 22px; font-weight: 800; line-height: 1; text-align: right; color: var(--ink-500); font-variant-numeric: tabular-nums; }
+    .incident .t { font-size: 13px; font-weight: 650; color: var(--ink-800); }
+    .incident .s { font-size: 12px; color: var(--ink-500); margin-top: 2px; line-height: 1.45; }
+    @media (max-width: 720px) {
+      .incident { grid-template-columns: 1fr; }
+      .incident .n { text-align: left; }
+      .toolbar .find { margin-left: 0; width: 100%; flex-wrap: wrap; }
+      .search { width: 100%; }
+    }
 
     .expand { background: var(--ink-50); }
     .expand td { padding: 0; }
@@ -123,9 +193,25 @@ interface OrderRow {
           }
         }
       </div>
-      <input class="input vendor-filter mono" type="text" placeholder="Vendor UUID filter…"
-             [(ngModel)]="vendorIdInput" (change)="reload()" />
+      <div class="find">
+        <input class="input search" type="search" [ngModel]="query()" (ngModelChange)="query.set($event)"
+               placeholder="Find an order — NEE-26243-0002, or a customer" aria-label="Find an order by number or customer" />
+        <select class="input vendor-pick" [ngModel]="vendorFilter()" (ngModelChange)="vendorFilter.set($event)"
+                aria-label="Filter by vendor">
+          <option value="">Every vendor</option>
+          @for (v of vendorOptions(); track v.id) { <option [value]="v.id">{{ v.name }}</option> }
+          @if (unroutedCount() > 0) { <option value="__none">No vendor attached ({{ unroutedCount() }})</option> }
+        </select>
+      </div>
     </div>
+
+    @if (actionError(); as e) {
+      <div class="action-error" role="alert">
+        <span aria-hidden="true">!</span>
+        <span>{{ e }}</span>
+        <button type="button" class="btn btn--ghost btn--sm" (click)="actionError.set(null)">Dismiss</button>
+      </div>
+    }
 
     @if (!loading() && !error() && all().length > 0) {
       <div class="lede" [class.crit]="counts().attention > 0" [class.ok]="counts().attention === 0">
@@ -147,10 +233,53 @@ interface OrderRow {
           [loading]="loading()" [error]="error()"
           [emptyTitle]="emptyTitle()"
           [emptyDetail]="emptyDetail()"
-          [clear]="view() === 'attention'"
+          [clear]="view() === 'attention' && !filtering()"
           (retry)="reload()" />
       </div>
     } @else {
+      @if (view() === 'attention' && incidents().length > 0) {
+        <div class="panel" style="margin-bottom:16px;">
+          <div class="panel-head">
+            <h2>Failure clusters</h2>
+            <span class="text-label">{{ incidents().length }} incident{{ incidents().length === 1 ? '' : 's' }}</span>
+          </div>
+          @for (inc of incidents(); track inc.id) {
+            <div class="incident">
+              <span class="n">{{ inc.orders.length }}</span>
+              <span>
+                <span class="t">{{ inc.orders.length }} orders failed inside {{ inc.spanLabel }}</span>
+                <span class="s">
+                  {{ inc.firstAt | when }} — one incident, not {{ inc.orders.length }} separate problems.
+                  Failed orders are terminal: there is nothing to reroute or cancel.
+                  {{ inc.vendorLabel }}
+                </span>
+              </span>
+              <span class="row-flex gap-6">
+                <button type="button" class="btn btn--ghost btn--sm" (click)="toggleIncident(inc.id)">
+                  {{ expandedIncidents().has(inc.id) ? 'Fold back up' : 'List them' }}
+                </button>
+                <button type="button" class="btn btn--ghost btn--sm" (click)="dismissIncident(inc.id)">
+                  Set aside
+                </button>
+              </span>
+            </div>
+          }
+          @if (dismissedIncidents().size > 0) {
+            <div class="incident">
+              <span class="n muted">{{ dismissedCount() }}</span>
+              <span>
+                <span class="t">{{ dismissedCount() }} failed order{{ dismissedCount() === 1 ? '' : 's' }} set aside</span>
+                <span class="s">
+                  Hidden from this board for this session only. Nothing was changed on the platform, and they are
+                  back after a reload — the backend has no "acknowledged" flag to write to.
+                </span>
+              </span>
+              <button type="button" class="btn btn--ghost btn--sm" (click)="restoreIncidents()">Bring back</button>
+            </div>
+          }
+        </div>
+      }
+
       <div class="panel table-wrap">
         <table class="data">
           <thead>
@@ -172,8 +301,8 @@ interface OrderRow {
                     <span class="mono">{{ r.order.orderNumber }}</span>
                   </button>
                   <div class="sub-cell">
-                    {{ r.order.customerName ?? short(r.order.customerId) }}
-                    · {{ r.order.placedAt | date:'d MMM, HH:mm' }} · {{ r.order.paymentMethod }}
+                    {{ r.order.customerName ?? unnamedCustomer(r.order.customerId) }}
+                    · {{ r.order.placedAt | when }} · {{ label(r.order.paymentMethod) }}
                   </div>
                 </td>
 
@@ -199,7 +328,7 @@ interface OrderRow {
                   <div class="clock" [class.crit]="r.stuck" [class.ok]="!r.stuck">
                     @if (r.overdueMs === null) { — }
                     @else if (r.stuck) { {{ dur(r.overdueMs) }} over }
-                    @else if (terminal(r.order)) { {{ r.order.deliverBy | date:'d MMM, HH:mm' }} }
+                    @else if (terminal(r.order)) { {{ r.order.deliverBy | when }} }
                     @else { {{ dur(r.overdueMs) }} left }
                   </div>
                   <div class="why" [class.crit]="r.severity === 'crit'">{{ r.reason }}</div>
@@ -207,9 +336,9 @@ interface OrderRow {
 
                 <td>
                   @if (r.order.vendorId) {
-                    <div class="primary-cell">{{ r.order.vendorName ?? short(r.order.vendorId) }}</div>
+                    <div class="primary-cell">{{ r.order.vendorName ?? unnamedVendor(r.order.vendorId) }}</div>
                     <div class="sub-cell">
-                      @if (r.order.driverId) { {{ r.order.driverName ?? short(r.order.driverId) }} driving }
+                      @if (r.order.driverId) { {{ r.order.driverName ?? unnamedDriver(r.order.driverId) }} driving }
                       @else { no driver yet }
                     </div>
                   } @else {
@@ -218,11 +347,11 @@ interface OrderRow {
                 </td>
 
                 <td class="right num">
-                  ₹{{ r.order.totalAmount | number:'1.0-0' }}
+                  {{ r.order.totalAmount | rupees }}
                   @if (r.order.surgeMultiplier > 1) {
                     <div class="sub-cell">{{ r.order.surgeMultiplier | number:'1.2-2' }}× surge</div>
                   } @else if (r.order.depositTotal > 0) {
-                    <div class="sub-cell">₹{{ r.order.depositTotal | number:'1.0-0' }} deposit</div>
+                    <div class="sub-cell">{{ r.order.depositTotal | rupees }} deposit</div>
                   }
                 </td>
 
@@ -231,11 +360,18 @@ interface OrderRow {
                     <span class="row-actions">
                       <button type="button" class="btn btn--ghost btn--sm" (click)="askReroute(r.order)"
                               [disabled]="busyId() === r.order.id">Reroute</button>
+                      <!-- Cancel is offered only from the stages the backend
+                           actually allows it from; elsewhere the control stays
+                           visible but disabled and says why, rather than taking
+                           a mandatory typed reason and then refusing. -->
                       <button type="button" class="btn btn--danger btn--sm" (click)="askCancel(r.order)"
-                              [disabled]="busyId() === r.order.id">Cancel</button>
+                              [disabled]="busyId() === r.order.id || !canCancel(r.order)"
+                              [title]="canCancel(r.order) ? 'Cancel this order' : cancelBlocked(r.order.status)">
+                        Cancel
+                      </button>
                     </span>
                   } @else {
-                    <span class="muted">closed</span>
+                    <span class="muted">{{ label(r.order.status).toLowerCase() }}</span>
                   }
                 </td>
               </tr>
@@ -251,9 +387,9 @@ interface OrderRow {
                             <div class="hist">
                               @for (h of d.history; track $index) {
                                 <div class="step">
-                                  <span class="t">{{ h.changedAt | date:'d MMM, HH:mm' }}</span>
+                                  <span class="t">{{ h.changedAt | when }}</span>
                                   <span class="s">{{ label(h.toStatus) }}</span>
-                                  <span class="r">{{ h.actorRole ? '· by ' + h.actorRole : '' }}{{ h.reason ? ' · ' + h.reason : '' }}</span>
+                                  <span class="r">{{ h.actorRole ? '· by ' + label(h.actorRole) : '' }}{{ h.reason ? ' · ' + h.reason : '' }}</span>
                                 </div>
                               }
                             </div>
@@ -274,19 +410,22 @@ interface OrderRow {
                           <div class="lines">
                             @for (i of d.items; track i.id) {
                               <div class="line">
-                                <span>{{ i.quantity }} × {{ i.productName }} <span class="muted">({{ i.containerMode }})</span></span>
-                                <span class="num">₹{{ i.subtotal | number:'1.0-0' }}</span>
+                                <span>
+                                  {{ i.quantity }} × {{ productName(i) }}
+                                  @if (i.containerMode) { <span class="muted">· {{ containerNote(i.containerMode) }}</span> }
+                                </span>
+                                <span class="num">{{ i.subtotal | rupees }}</span>
                               </div>
                             }
                             @if (!d.items.length) { <span class="muted">No line items on this order.</span> }
                           </div>
                           <div class="money">
-                            <span>Subtotal</span><span class="amt">₹{{ d.subtotal | number:'1.2-2' }}</span>
-                            <span>Delivery</span><span class="amt">₹{{ d.deliveryFee | number:'1.2-2' }}</span>
-                            @if (d.surgeSurcharge > 0) { <span>Surge</span><span class="amt">₹{{ d.surgeSurcharge | number:'1.2-2' }}</span> }
-                            @if (d.depositTotal > 0) { <span>Container deposit</span><span class="amt">₹{{ d.depositTotal | number:'1.2-2' }}</span> }
-                            @if (d.discount > 0) { <span>Discount</span><span class="amt">−₹{{ d.discount | number:'1.2-2' }}</span> }
-                            <span class="total">Total</span><span class="amt total">₹{{ d.totalAmount | number:'1.2-2' }}</span>
+                            <span>Subtotal</span><span class="amt">{{ d.subtotal | rupees }}</span>
+                            <span>Delivery</span><span class="amt">{{ d.deliveryFee | rupees }}</span>
+                            @if (d.surgeSurcharge > 0) { <span>Surge</span><span class="amt">{{ d.surgeSurcharge | rupees }}</span> }
+                            @if (d.depositTotal > 0) { <span>Container deposit</span><span class="amt">{{ d.depositTotal | rupees }}</span> }
+                            @if (d.discount > 0) { <span>Discount</span><span class="amt">−{{ d.discount | rupees }}</span> }
+                            <span class="total">Total</span><span class="amt total">{{ d.totalAmount | rupees }}</span>
                           </div>
                         }
                       </div>
@@ -301,7 +440,10 @@ interface OrderRow {
 
       <div class="row-flex gap-12 mt-16" style="font-size:12.5px;color:var(--ink-600);">
         <button type="button" class="btn btn--ghost btn--sm" (click)="prev()" [disabled]="page() === 0">‹ Previous</button>
-        <span>Page {{ page() + 1 }} · {{ rows().length }} shown of {{ all().length }} fetched</span>
+        <span>
+          Showing {{ rows().length }} of {{ all().length }} order{{ all().length === 1 ? '' : 's' }} on this page
+          @if (query().trim() || vendorFilter()) { · filtered }
+        </span>
         <button type="button" class="btn btn--ghost btn--sm" (click)="next()" [disabled]="all().length < pageSize">Next ›</button>
       </div>
     }
@@ -314,16 +456,34 @@ export class OrdersComponent {
   private api = inject(ApiClient);
   private clock = inject(ClockService);
   private route = inject(ActivatedRoute);
+  private toasts = inject(ToastService);
 
   pipeline = PIPELINE;
   readonly pageSize = 100;
 
   view = signal<View>('attention');
-  vendorIdInput = '';
+  /** Free-text find: order number or customer name. Both are on every row. */
+  query = signal('');
+  /** Vendor id, `__none` for unrouted, or '' for every vendor. */
+  vendorFilter = signal('');
   page = signal(0);
   loading = signal(true);
+  /** A failed *load*: the board has nothing to show. */
   error = signal<string | null>(null);
+  /**
+   * A failed *action*: the board is fine, the thing you just pressed is not.
+   *
+   * These used to share one slot, so a refused cancellation replaced the whole
+   * 27-row board with "Couldn't load the order board" — which was untrue, and
+   * cost the operator the list they were working.
+   */
+  actionError = signal<string | null>(null);
   all = signal<AdminOrder[]>([]);
+
+  /** Failure clusters folded open by the operator. */
+  readonly expandedIncidents = signal<ReadonlySet<string>>(new Set());
+  /** Clusters set aside for this session. Never written to the backend. */
+  readonly dismissedIncidents = signal<ReadonlySet<string>>(new Set());
 
   expandedId = signal<string | null>(null);
   detail = signal<AdminOrder | null>(null);
@@ -340,10 +500,38 @@ export class OrdersComponent {
 
   setView(v: View) { this.view.set(v); this.expandedId.set(null); }
 
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
   dur(ms: number) { return formatDuration(ms); }
-  short(id: string) { return id.slice(0, 8); }
   terminal(o: AdminOrder) { return TERMINAL_ORDER_STATUSES.has(o.status); }
+
+  /** Whether the backend will accept a cancel from this order's current stage. */
+  canCancel(o: AdminOrder) { return CANCELLABLE.has(o.status); }
+  cancelBlocked(status: string) { return cancelBlockedReason(status); }
+
+  // A party the payload could not name still shows its id — it is the only
+  // handle for a support ticket — but never dressed up as a name.
+  unnamedCustomer(id: string) { return `unnamed customer · ${id.slice(0, 8)}`; }
+  unnamedVendor(id: string) { return `unnamed vendor · ${id.slice(0, 8)}`; }
+  unnamedDriver(id: string) { return `unnamed driver · ${id.slice(0, 8)}`; }
+
+  /**
+   * The basket used to print the product UUID, because this path returns the id
+   * in `productName`. The backend now sends a real name; a value that still
+   * looks like a UUID is labelled as unresolved rather than shown as a product.
+   */
+  productName(item: { productName: string; productId: string }): string {
+    const name = (item.productName ?? '').trim();
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(name);
+    if (!name || isUuid) return `unnamed product · ${(item.productId ?? name).slice(0, 8)}`;
+    return name;
+  }
+
+  /** `KEEP` / `TRANSFER_AND_RETURN` said in words. */
+  containerNote(mode: string): string {
+    if (mode === 'KEEP') return 'customer keeps the container';
+    if (mode === 'TRANSFER_AND_RETURN') return 'container returns with the driver';
+    return enumLabel(mode).toLowerCase();
+  }
 
   /** Six-segment progress track: 1 = reached, 2 = ended badly, 0 = not yet. */
   trackFor(o: AdminOrder): number[] {
@@ -403,14 +591,140 @@ export class OrdersComponent {
     return r.order.status === 'FAILED' || r.stuck || (r.unrouted && !this.terminal(r.order));
   }
 
+  /**
+   * Vendors to filter by, taken from the rows on screen.
+   *
+   * The old control was a free-text "Vendor UUID" box: no UUID is displayed
+   * anywhere in the portal, and typing the vendor's name blanked the screen with
+   * "Parameter 'vendorId' has invalid type". A select built from the names
+   * actually present cannot be typed wrong and needs nothing the operator has
+   * not already seen.
+   */
+  readonly vendorOptions = computed(() => {
+    const seen = new Map<string, string>();
+    for (const o of this.all()) {
+      if (o.vendorId && !seen.has(o.vendorId)) {
+        seen.set(o.vendorId, o.vendorName ?? `unnamed vendor · ${o.vendorId.slice(0, 8)}`);
+      }
+    }
+    return [...seen.entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  });
+
+  readonly unroutedCount = computed(() => this.all().filter(o => !o.vendorId).length);
+
+  /**
+   * Failed orders clustered into incidents.
+   *
+   * 24 of 27 "needs action" rows were FAILED inside one three-minute window —
+   * one routing incident wearing 24 hats. Failed is terminal, so none of them
+   * has an action on it; leaving them loose buries the two or three orders that
+   * can still be rescued. Orders whose failures land within ten minutes of each
+   * other are one cluster.
+   */
+  readonly incidents = computed<Incident[]>(() => {
+    const failed = this.decorated()
+      .filter(r => r.order.status === 'FAILED')
+      .map(row => ({ row, at: this.failedAt(row.order) }))
+      .filter(x => Number.isFinite(x.at))
+      .sort((a, b) => a.at - b.at);
+
+    const groups: { at: number; row: OrderRow }[][] = [];
+    let group: { at: number; row: OrderRow }[] = [];
+    let lastAt = -Infinity;
+    for (const item of failed) {
+      if (group.length && item.at - lastAt > INCIDENT_WINDOW_MS) {
+        groups.push(group);
+        group = [];
+      }
+      group.push(item);
+      lastAt = item.at;
+    }
+    if (group.length) groups.push(group);
+
+    // A single failure is just a failed order — only a run of them is an incident.
+    return groups
+      .filter(g => g.length >= INCIDENT_MIN_SIZE)
+      .map(g => {
+        const orders = g.map(x => x.row.order);
+        const spanMs = g[g.length - 1].at - g[0].at;
+        const vendors = new Set(orders.map(o => o.vendorName ?? (o.vendorId ? `unnamed vendor · ${o.vendorId.slice(0, 8)}` : 'no vendor attached')));
+        return {
+          id: new Date(g[0].at).toISOString(),
+          orders,
+          firstAt: new Date(g[0].at).toISOString(),
+          spanLabel: spanMs < 60_000 ? 'under a minute' : formatDuration(spanMs),
+          vendorLabel: vendors.size === 1 ? `All against ${[...vendors][0]}.` : `Across ${vendors.size} vendors.`
+        };
+      })
+      .sort((a, b) => b.orders.length - a.orders.length);
+  });
+
+  /** Ids of failed orders currently folded away inside a cluster. */
+  private hiddenOrderIds = computed<ReadonlySet<string>>(() => {
+    const expanded = this.expandedIncidents();
+    const dismissed = this.dismissedIncidents();
+    const hidden = new Set<string>();
+    for (const inc of this.incidents()) {
+      if (dismissed.has(inc.id) || !expanded.has(inc.id)) {
+        for (const o of inc.orders) hidden.add(o.id);
+      }
+    }
+    return hidden;
+  });
+
+  readonly dismissedCount = computed(() =>
+    this.incidents()
+      .filter(inc => this.dismissedIncidents().has(inc.id))
+      .reduce((n, inc) => n + inc.orders.length, 0));
+
+  toggleIncident(id: string) {
+    this.expandedIncidents.update(set => {
+      const next = new Set(set);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  dismissIncident(id: string) {
+    this.dismissedIncidents.update(set => new Set(set).add(id));
+    this.expandedIncidents.update(set => { const n = new Set(set); n.delete(id); return n; });
+  }
+
+  restoreIncidents() { this.dismissedIncidents.set(new Set()); }
+
+  /** When this order actually failed, preferring its own history over placement. */
+  private failedAt(o: AdminOrder): number {
+    const last = o.history?.length ? o.history[o.history.length - 1].changedAt : null;
+    return Date.parse(last ?? o.placedAt);
+  }
+
   readonly rows = computed<OrderRow[]>(() => {
     const v = this.view();
     const rows = this.decorated();
-    const filtered =
+    const base =
       v === 'attention' ? rows.filter(r => this.needsAction(r))
       : v === 'live'    ? rows.filter(r => !this.terminal(r.order))
       : v === 'all'     ? rows
       : rows.filter(r => r.order.status === v);
+
+    // Clusters only fold rows away on the triage view — every other view is a
+    // deliberate look at a status, and hiding rows there would be a lie.
+    const folded = v === 'attention' ? this.hiddenOrderIds() : new Set<string>();
+
+    const q = this.query().trim().toLowerCase();
+    const vendor = this.vendorFilter();
+
+    const filtered = base.filter(r => {
+      if (folded.has(r.order.id)) return false;
+      if (vendor === '__none' && r.order.vendorId) return false;
+      if (vendor && vendor !== '__none' && r.order.vendorId !== vendor) return false;
+      if (!q) return true;
+      return r.order.orderNumber.toLowerCase().includes(q)
+        || (r.order.customerName ?? '').toLowerCase().includes(q)
+        || (r.order.vendorName ?? '').toLowerCase().includes(q);
+    });
 
     // Worst first, then longest overdue, then newest.
     const rank: Record<Severity, number> = { crit: 0, warn: 1, ok: 2, idle: 3 };
@@ -420,28 +734,33 @@ export class OrdersComponent {
       Date.parse(b.order.placedAt) - Date.parse(a.order.placedAt));
   });
 
+  readonly filtering = computed(() => !!this.query().trim() || !!this.vendorFilter());
+
   readonly emptyTitle = computed(() => {
+    if (this.filtering()) return 'Nothing matches that search';
     if (this.view() === 'attention') return 'Nothing is stranded';
     if (this.view() === 'live') return 'No orders in flight';
-    return 'No orders match this filter';
+    return 'No orders in this stage';
   });
 
   readonly emptyDetail = computed(() => {
+    if (this.filtering()) {
+      return 'Search covers the order number and the customer and vendor names on this page. Clear the box, or widen the stage filter above.';
+    }
     if (this.view() === 'attention') {
       return 'Every open order has a vendor attached and is still inside the window the customer was promised.';
     }
     if (this.view() === 'live') return 'Every order on file has reached a terminal state.';
-    return 'Try a wider filter, or clear the vendor UUID box.';
+    return 'No order currently sits at this stage.';
   });
 
   reload() {
     this.loading.set(true);
     this.error.set(null);
-    const params: Record<string, string | number> = { page: this.page(), size: this.pageSize };
-    const vendor = this.vendorIdInput.trim();
-    if (vendor.length > 0) params['vendorId'] = vendor;
-    // Status filtering happens client-side so the counts on every chip stay live.
-    this.api.get<AdminOrder[]>('/admin/orders', params).subscribe({
+    // Status, vendor and text filtering all happen client-side on the fetched
+    // page, so every chip keeps a live count and the search box can match a
+    // customer name — which the list endpoint cannot filter on.
+    this.api.get<AdminOrder[]>('/admin/orders', { page: this.page(), size: this.pageSize }).subscribe({
       next: data => { this.all.set(Array.isArray(data) ? data : []); this.loading.set(false); this.clock.sync(); },
       error: e => {
         this.error.set(describeError(e, 'the order board'));
@@ -482,7 +801,7 @@ export class OrdersComponent {
   askCancel(o: AdminOrder) {
     this.confirm.set({
       title: 'Cancel order',
-      message: `${o.orderNumber} — ₹${Number(o.totalAmount).toFixed(2)}, currently ${humanize(o.status)}.`,
+      message: `${o.orderNumber} — ${formatRupees(o.totalAmount)}, currently ${enumLabel(o.status).toLowerCase()}.`,
       confirmLabel: 'Cancel order',
       tone: 'danger',
       reason: {
@@ -491,7 +810,10 @@ export class OrdersComponent {
         required: true,
         initial: ''
       },
-      consequence: 'Cancellation is final — the order cannot be reopened, and any container deposit follows the refund path.'
+      consequence: 'Cancellation is final — the order cannot be reopened, and any container deposit follows the refund path.',
+      // Two buttons both starting with "Cancel" made the safe choice read as
+      // the destructive one. The dismiss button says what it preserves.
+      cancelLabel: 'Keep order'
     });
     this.pending = () => this.cancel(o);
   }
@@ -508,17 +830,36 @@ export class OrdersComponent {
 
   private reroute(o: AdminOrder) {
     this.busyId.set(o.id);
+    this.actionError.set(null);
     this.api.post<AdminOrder>(`/admin/orders/${o.id}/reroute`, {}).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.error.set(describeError(e, 'the reroute')); this.busyId.set(null); }
+      next: updated => {
+        this.busyId.set(null);
+        this.toasts.success(
+          `${o.orderNumber} rebroadcast`,
+          updated?.vendorName
+            ? `Now with ${updated.vendorName}. The customer was not charged again.`
+            : 'Looking for the next eligible vendor in its service area. The customer was not charged again.'
+        );
+        this.reload();
+      },
+      // The board loaded fine — only the reroute failed, so the list stays.
+      error: e => { this.actionError.set(describeActionError(e, 'rerouting this order')); this.busyId.set(null); }
     });
   }
 
   private cancel(o: AdminOrder) {
     this.busyId.set(o.id);
+    this.actionError.set(null);
     this.api.post<AdminOrder>(`/admin/orders/${o.id}/cancel`, { reason: this.lastReason }).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.error.set(describeError(e, 'the cancellation')); this.busyId.set(null); }
+      next: () => {
+        this.busyId.set(null);
+        this.toasts.success(
+          `${o.orderNumber} cancelled`,
+          `${formatRupees(o.totalAmount)} order closed. The reason you gave is on the customer's record and in the audit log.`
+        );
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'cancelling this order')); this.busyId.set(null); }
     });
   }
 }

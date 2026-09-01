@@ -1,4 +1,6 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
+import { provideHttpClient } from '@angular/common/http';
+import { provideHttpClientTesting } from '@angular/common/http/testing';
 import { of } from 'rxjs';
 import { ComplaintsComponent } from './complaints.component';
 import { ComplaintService } from './complaint.service';
@@ -44,7 +46,14 @@ describe('ComplaintsComponent', () => {
 
     await TestBed.configureTestingModule({
       imports: [ComplaintsComponent],
-      providers: [{ provide: ComplaintService, useValue: service }]
+      providers: [
+        { provide: ComplaintService, useValue: service },
+        // The desk resolves party names through DirectoryService, which talks to
+        // the API; the tests stub the transport rather than the service so the
+        // component wires up exactly as it does at runtime.
+        provideHttpClient(),
+        provideHttpClientTesting()
+      ]
     }).compileComponents();
 
     fixture = TestBed.createComponent(ComplaintsComponent);

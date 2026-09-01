@@ -9,8 +9,13 @@ import type {
 export class ComplaintService {
   private api = inject(ApiClient);
 
-  list(page = 0, size = 20): Observable<Complaint[]> {
-    return this.api.get('/admin/complaints', { page, size });
+  /**
+   * Open queue by default. Passing a decided status (RESOLVED, CLOSED) is what
+   * makes a decision reachable again — a resolved ticket used to vanish from
+   * every list, stranding the "Close ticket" step it still needed.
+   */
+  list(page = 0, size = 20, status?: string): Observable<Complaint[]> {
+    return this.api.get('/admin/complaints', status ? { page, size, status } : { page, size });
   }
 
   get(id: string): Observable<Complaint> {

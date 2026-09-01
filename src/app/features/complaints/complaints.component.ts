@@ -3,16 +3,38 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ComplaintService } from './complaint.service';
 import type { Complaint, ComplaintPriority, ResolutionAction } from './complaint.model';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { DirectoryService, unknownParty } from '../../shared/directory.service';
+import { label as enumLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
+import { EvidenceStripComponent } from '../../shared/ui/evidence-strip.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { formatRupees } from '../../shared/ui/format';
+import { WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
   ConfirmDialogComponent, ConfirmRequest, ConfirmResult
 } from '../../shared/ui/confirm-dialog.component';
 import {
-  MS_HOUR, Severity, SlaState, formatDuration, humanize, msSince, slaState
+  MS_HOUR, Severity, SlaState, formatDuration, msSince, slaState
 } from '../../shared/ui/urgency';
+
+/** Priorities the operator can set, in the order they escalate. */
+const PRIORITIES: ComplaintPriority[] = ['LOW', 'NORMAL', 'HIGH', 'URGENT'];
+
+/**
+ * Which queue the desk is showing. Decided tickets are now returned by the
+ * backend, so a resolution stays reachable instead of vanishing the moment it
+ * is made — which is what stranded tickets between RESOLVED and CLOSED.
+ */
+const DESK_VIEWS = [
+  { key: 'open', label: 'Open', status: undefined },
+  { key: 'RESOLVED', label: 'Resolved, not yet closed', status: 'RESOLVED' },
+  { key: 'CLOSED', label: 'Closed', status: 'CLOSED' }
+] as const;
+
+type DeskView = typeof DESK_VIEWS[number]['key'];
 
 type Band = 'breached' | 'soon' | 'today' | 'later' | 'done';
 
@@ -48,7 +70,10 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
 @Component({
   selector: 'app-complaints',
   standalone: true,
-  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
+  imports: [
+    CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent,
+    EvidenceStripComponent, WhenPipe
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
@@ -107,9 +132,7 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
     .sla-strip.crit { background: var(--err-soft); }
     .sla-strip.warn { background: var(--warn-soft); }
     .sla-strip.ok   { background: var(--ok-soft); }
-    .sla-big {
-      font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1;
-    }
+    .sla-big { font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; }
     .sla-strip.crit .sla-big, .sla-strip.crit .sla-sub { color: var(--err-ink); }
     .sla-strip.warn .sla-big, .sla-strip.warn .sla-sub { color: var(--warn-ink); }
     .sla-strip.ok   .sla-big, .sla-strip.ok   .sla-sub { color: var(--ok-ink); }
@@ -126,10 +149,7 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
       font-size: 13.5px; line-height: 1.6; color: var(--ink-800); white-space: pre-wrap;
     }
 
-    .facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; background: var(--ink-100); margin: 0 22px; border-radius: var(--r-sm); overflow: hidden; }
-    .fact { background: var(--paper); padding: 10px 13px; }
-    .fact .k { font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-500); }
-    .fact .v { font-size: 13px; color: var(--ink-900); font-weight: 600; margin-top: 3px; word-break: break-all; }
+    .facts { margin: 0 22px; }
 
     .thread { margin: 20px 22px 0; }
     .msg { padding: 11px 14px; border-radius: var(--r-md); margin-bottom: 8px; background: var(--ink-50); }
@@ -143,6 +163,12 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
     }
     .resolve-form { margin: 0 22px 22px; padding: 16px; background: var(--ink-50); border-radius: var(--r-md); }
     .resolve-grid { display: grid; grid-template-columns: 1fr 160px; gap: 12px; }
+    @media (max-width: 620px) { .resolve-grid { grid-template-columns: 1fr; } }
+
+    .triage-row {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      margin: 0 22px; padding: 12px 0 0;
+    }
   `],
   template: `
     <app-page-header
@@ -153,14 +179,27 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
       </button>
     </app-page-header>
 
+    <div class="toolbar">
+      <div class="chips">
+        @for (v of deskViews; track v.key) {
+          <button type="button" class="chip" [class.active]="view() === v.key" (click)="setView(v.key)">
+            {{ v.label }}
+            @if (view() === v.key && !loading()) { <span class="count">{{ items().length }}</span> }
+          </button>
+        }
+      </div>
+    </div>
+
     @if (loading() || error() || items().length === 0) {
       <div class="panel">
         <app-data-state
           what="the dispute queue"
           [loading]="loading()" [error]="error()"
-          emptyTitle="No open disputes"
-          emptyDetail="Nothing is waiting on a decision. When a customer files, it lands here with its 24-hour clock already running."
-          [clear]="true"
+          [emptyTitle]="view() === 'open' ? 'No open disputes' : 'Nothing in this view'"
+          [emptyDetail]="view() === 'open'
+            ? 'Nothing is waiting on a decision. When a customer files, it lands here with its 24-hour clock already running.'
+            : 'No ticket currently carries this status.'"
+          [clear]="view() === 'open'"
           (retry)="reload()" />
       </div>
     } @else {
@@ -188,7 +227,7 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
                 <span class="t-meta">
                   <span class="pill" [class.pill--crit]="t.priority === 'URGENT'"
                         [class.pill--warn]="t.priority === 'HIGH'"
-                        [class.pill--mute]="t.priority === 'NORMAL' || t.priority === 'LOW'">{{ t.priority }}</span>
+                        [class.pill--mute]="t.priority === 'NORMAL' || t.priority === 'LOW'">{{ label(t.priority) }}</span>
                   <span class="pill pill--outline">{{ label(t.category) }}</span>
                   @if (t.awaitingFirstResponse) {
                     <span class="pill pill--warn">No reply yet</span>
@@ -208,7 +247,7 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
                 <span class="pill pill--brand">{{ label(s.status) }}</span>
                 <span class="pill" [class.pill--crit]="s.priority === 'URGENT'"
                       [class.pill--warn]="s.priority === 'HIGH'"
-                      [class.pill--mute]="s.priority === 'NORMAL' || s.priority === 'LOW'">{{ s.priority }}</span>
+                      [class.pill--mute]="s.priority === 'NORMAL' || s.priority === 'LOW'">{{ label(s.priority) }} priority</span>
                 <span class="pill pill--outline">{{ label(s.category) }}</span>
               </div>
             </div>
@@ -220,8 +259,8 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
               <div>
                 <div class="sla-big">{{ detailSla().label }}</div>
                 <div class="sla-sub">
-                  Resolution SLA · due {{ s.slaDeadline | date:'d MMM, HH:mm' }}
-                  @if (s.firstResponseAt) { · first reply {{ s.firstResponseAt | date:'d MMM, HH:mm' }} }
+                  Resolution SLA · due {{ s.slaDeadline | when }}
+                  @if (s.firstResponseAt) { · first reply {{ s.firstResponseAt | when }} }
                   @else { · no reply sent yet }
                 </div>
               </div>
@@ -231,16 +270,36 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
             <div class="desc">{{ s.description }}</div>
 
             <div class="facts">
-              <div class="fact"><div class="k">Filed</div><div class="v">{{ s.filedAt | date:'d MMM y, HH:mm' }}</div></div>
-              <div class="fact"><div class="k">Customer</div><div class="v mono">{{ short(s.customerId) }}</div></div>
-              <div class="fact"><div class="k">Vendor</div><div class="v mono">{{ s.vendorId ? short(s.vendorId) : 'unassigned' }}</div></div>
-              <div class="fact"><div class="k">Order</div><div class="v mono">{{ s.orderId ? short(s.orderId) : 'not order-linked' }}</div></div>
-              @if (s.evidencePhotos.length) {
-                <div class="fact"><div class="k">Evidence</div><div class="v">{{ s.evidencePhotos.length }} photo{{ s.evidencePhotos.length === 1 ? '' : 's' }} attached</div></div>
-              }
+              <div class="fact"><div class="k">Filed</div><div class="v">{{ s.filedAt | when }}</div></div>
+              <div class="fact">
+                <div class="k">Customer</div>
+                <div class="v">{{ customerName(s) ?? unknownCustomer(s) }}</div>
+                @if (s.customerPhone) {
+                  <div class="mt-4"><a class="link" [href]="'tel:' + s.customerPhone">{{ s.customerPhone }}</a></div>
+                }
+              </div>
+              <div class="fact">
+                <div class="k">Vendor</div>
+                <div class="v">{{ s.vendorId ? (vendorName(s) ?? unknownVendor(s)) : 'No vendor named on this ticket' }}</div>
+              </div>
+              <div class="fact">
+                <div class="k">Order</div>
+                <div class="v">{{ orderRef(s) }}</div>
+              </div>
               @if (s.resolutionAction) {
-                <div class="fact"><div class="k">Verdict</div><div class="v">{{ label(s.resolutionAction) }} · ₹{{ s.awardedAmount ?? 0 }}</div></div>
+                <div class="fact">
+                  <div class="k">Verdict</div>
+                  <div class="v">
+                    {{ label(s.resolutionAction) }}@if (s.awardedAmount) { · {{ money(s.awardedAmount) }} }
+                  </div>
+                </div>
               }
+            </div>
+
+            <div class="thread">
+              <div class="text-label" style="margin-bottom:8px;">Evidence the customer filed</div>
+              <app-evidence-strip [keys]="s.evidencePhotos"
+                                  emptyText="The customer filed no photographs with this complaint." />
             </div>
 
             @if (s.messages?.length) {
@@ -248,18 +307,30 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
                 <div class="text-label" style="margin-bottom: 8px;">Thread</div>
                 @for (m of s.messages; track m.id) {
                   <div class="msg" [class.internal]="m.isInternal">
-                    <div class="who">{{ m.authorRole }}{{ m.isInternal ? ' · internal note' : '' }} · {{ m.createdAt | date:'d MMM, HH:mm' }}</div>
+                    <div class="who">{{ label(m.authorRole) }}{{ m.isInternal ? ' · internal note' : '' }} · {{ m.createdAt | when }}</div>
                     <div class="text">{{ m.message }}</div>
                   </div>
                 }
               </div>
             }
 
+            <!-- Priority is a working decision, not a one-time stamp: it was
+                 previously settable only while the ticket was still OPEN, so a
+                 dispute that turned out worse than it looked could never be
+                 raised. Any open ticket can be re-prioritised, and the level it
+                 already carries is shown as selected rather than offered again. -->
+            @if (isOpen(s)) {
+              <div class="triage-row">
+                <span class="text-label">Priority</span>
+                @for (p of priorities; track p) {
+                  <button type="button" class="chip" [class.active]="s.priority === p"
+                          [disabled]="busy() || s.priority === p"
+                          (click)="askTriage(p)">{{ label(p) }}</button>
+                }
+              </div>
+            }
+
             <div class="actions">
-              @if (s.status === 'OPEN') {
-                <button type="button" class="btn btn--ghost btn--sm" (click)="askTriage('HIGH')">Triage HIGH</button>
-                <button type="button" class="btn btn--ghost btn--sm" (click)="askTriage('URGENT')">Triage URGENT</button>
-              }
               @if (s.status === 'OPEN' || s.status === 'TRIAGED') {
                 <button type="button" class="btn btn--primary btn--sm" (click)="askStart()">Start work</button>
               }
@@ -280,12 +351,16 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
                 <div class="resolve-grid">
                   <div>
                     <label class="field-label" for="cx-action">Resolution action</label>
+                    <!-- Opens unselected. A pre-filled "Wallet credit" is a
+                         money-moving default one careless click away from being
+                         published; the operator has to name the outcome. -->
                     <select id="cx-action" class="input" [(ngModel)]="resolveAction">
-                      <option value="REFUND">Refund to source</option>
-                      <option value="WALLET_CREDIT">Wallet credit</option>
+                      <option [ngValue]="null" disabled>Choose what happens…</option>
+                      <option value="NO_ACTION">No action — complaint not upheld</option>
                       <option value="REPLACEMENT">Replacement delivery</option>
-                      <option value="VENDOR_PENALTY">Vendor penalty</option>
-                      <option value="NO_ACTION">No action</option>
+                      <option value="VENDOR_PENALTY">Penalty against the vendor</option>
+                      <option value="WALLET_CREDIT">Credit to Neerly wallet · moves money</option>
+                      <option value="REFUND">Refund to original payment method · moves money</option>
                     </select>
                   </div>
                   <div>
@@ -296,8 +371,17 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
                 <label class="field-label mt-12" for="cx-notes">Notes to both parties</label>
                 <textarea id="cx-notes" class="input" [(ngModel)]="resolveNotes"
                           placeholder="What you decided and why. Both the customer and the vendor see this."></textarea>
+                @if (movesMoney()) {
+                  <div class="mt-12 text-meta" style="color:var(--warn-ink);font-weight:600;">
+                    {{ label(resolveAction!) }} takes money out of the platform. It cannot be clawed back once published.
+                  </div>
+                }
                 <div class="mt-12">
-                  <button type="button" class="btn btn--ok btn--sm" (click)="askResolve()">Review verdict…</button>
+                  <button type="button" class="btn btn--ok btn--sm" (click)="askResolve()"
+                          [disabled]="!resolveAction">Review verdict…</button>
+                  @if (!resolveAction) {
+                    <span class="muted" style="margin-left:10px;font-size:12.5px;">Pick a resolution action first.</span>
+                  }
                 </div>
               </div>
             }
@@ -319,6 +403,12 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
 export class ComplaintsComponent {
   private service = inject(ComplaintService);
   private clock = inject(ClockService);
+  private toasts = inject(ToastService);
+  private directory = inject(DirectoryService);
+
+  priorities = PRIORITIES;
+  deskViews = DESK_VIEWS;
+  view = signal<DeskView>('open');
 
   loading = signal(true);
   error = signal<string | null>(null);
@@ -331,11 +421,46 @@ export class ComplaintsComponent {
   confirm = signal<ConfirmRequest | null>(null);
   private pending: ((r: ConfirmResult) => void) | null = null;
 
-  resolveAction: ResolutionAction = 'WALLET_CREDIT';
+  /** Deliberately unset — see the note on the select in the template (E2). */
+  resolveAction: ResolutionAction | null = null;
   resolveAmount: number | null = null;
   resolveNotes = '';
 
-  constructor() { this.reload(); }
+  constructor() {
+    this.reload();
+    this.directory.ensureLoaded();
+  }
+
+  setView(v: DeskView) { this.view.set(v); this.selected.set(null); this.reload(); }
+
+  isOpen(c: Complaint) {
+    return c.status === 'OPEN' || c.status === 'TRIAGED' || c.status === 'IN_PROGRESS';
+  }
+
+  /** True when the chosen resolution takes money off the platform. */
+  movesMoney() { return this.resolveAction === 'REFUND' || this.resolveAction === 'WALLET_CREDIT'; }
+
+  money(v: number | null | undefined) { return formatRupees(v); }
+
+  customerName(c: Complaint): string | null {
+    return c.customerName ?? this.directory.customerName(c.customerId);
+  }
+
+  vendorName(c: Complaint): string | null {
+    return c.vendorName ?? this.directory.vendorName(c.vendorId);
+  }
+
+  unknownCustomer(c: Complaint) { return unknownParty('customer', c.customerId); }
+  unknownVendor(c: Complaint) { return unknownParty('vendor', c.vendorId); }
+
+  /**
+   * The order the customer is complaining about, by the number printed on the
+   * board — a raw `orderId` cannot be reconciled with anything the admin sees.
+   */
+  orderRef(c: Complaint): string {
+    if (!c.orderId) return 'Not linked to an order';
+    return c.orderNumber ?? this.directory.orderNumber(c.orderId) ?? unknownParty('order', c.orderId);
+  }
 
   // --- derived view model -------------------------------------------------
 
@@ -389,16 +514,16 @@ export class ComplaintsComponent {
   });
 
   meta(band: Band) { return BAND_META[band]; }
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
   age(ms: number) { return formatDuration(ms); }
-  short(id: string) { return id.slice(0, 8); }
 
   // --- data ---------------------------------------------------------------
 
   reload() {
     this.loading.set(true);
     this.error.set(null);
-    this.service.list(0, 100).subscribe({
+    const status = DESK_VIEWS.find(v => v.key === this.view())?.status;
+    this.service.list(0, 100, status).subscribe({
       next: rows => {
         const list = Array.isArray(rows) ? rows : [];
         this.items.set(list);
@@ -433,10 +558,12 @@ export class ComplaintsComponent {
   askTriage(priority: ComplaintPriority) {
     const s = this.selected();
     if (!s) return;
+    const from = enumLabel(s.priority).toLowerCase();
+    const to = enumLabel(priority).toLowerCase();
     this.ask({
-      title: `Triage as ${priority}`,
-      message: `"${s.subject}" moves to ${priority} priority. This does not change the SLA deadline — it changes what you work first.`,
-      confirmLabel: `Set ${priority}`,
+      title: `Move to ${to} priority`,
+      message: `"${s.subject}" goes from ${from} to ${to}. This does not change the SLA deadline — it changes what you work first.`,
+      confirmLabel: `Set ${to}`,
       tone: 'primary'
     }, () => this.triage(priority));
   }
@@ -455,13 +582,17 @@ export class ComplaintsComponent {
   askResolve() {
     const s = this.selected();
     if (!s) return;
+    if (!this.resolveAction) return;
     const amount = this.resolveAmount ?? 0;
     this.ask({
       title: 'Publish verdict',
-      message: `${humanize(this.resolveAction)}${amount > 0 ? ` of ₹${amount}` : ''} on "${s.subject}".`,
-      confirmLabel: 'Resolve ticket',
-      tone: 'ok',
-      consequence: 'Both the customer and the vendor are notified, and the decision is written to the append-only audit log.'
+      message: `${enumLabel(this.resolveAction)}${amount > 0 ? ` of ${formatRupees(amount)}` : ''} on "${s.subject}".`,
+      confirmLabel: 'Publish verdict',
+      // Money-moving outcomes get the danger treatment; the rest do not.
+      tone: this.movesMoney() ? 'danger' : 'ok',
+      consequence: this.movesMoney()
+        ? `${enumLabel(this.resolveAction)} cannot be clawed back. Both parties are notified and the decision is written to the append-only audit log.`
+        : 'Both the customer and the vendor are notified, and the decision is written to the append-only audit log.'
     }, () => this.submitResolve());
   }
 
@@ -495,8 +626,16 @@ export class ComplaintsComponent {
     if (!s) return;
     this.busy.set(true);
     this.service.triage(s.id, { priority }).subscribe({
-      next: updated => { this.selected.set({ ...updated, messages: s.messages }); this.busy.set(false); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'this ticket')); this.busy.set(false); }
+      next: updated => {
+        this.selected.set({ ...updated, messages: s.messages });
+        this.busy.set(false);
+        this.toasts.success(
+          `Priority now ${enumLabel(priority).toLowerCase()}`,
+          `"${s.subject}" moves up your queue. The 24-hour resolution deadline is unchanged.`
+        );
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'changing the priority')); this.busy.set(false); }
     });
   }
 
@@ -505,17 +644,23 @@ export class ComplaintsComponent {
     if (!s) return;
     this.busy.set(true);
     this.service.start(s.id).subscribe({
-      next: updated => { this.selected.set(updated); this.busy.set(false); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'this ticket')); this.busy.set(false); }
+      next: updated => {
+        this.selected.set(updated);
+        this.busy.set(false);
+        this.toasts.success('Marked in progress', 'Your first response is stamped against the 4-hour target.');
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'starting work on this ticket')); this.busy.set(false); }
     });
   }
 
   submitResolve() {
     const s = this.selected();
-    if (!s) return;
+    const action = this.resolveAction;
+    if (!s || !action) return;
     this.busy.set(true);
     this.service.resolve(s.id, {
-      action: this.resolveAction,
+      action,
       notes: this.resolveNotes || undefined,
       awardedAmount: this.resolveAmount ?? undefined
     }).subscribe({
@@ -523,9 +668,15 @@ export class ComplaintsComponent {
         this.selected.set(updated);
         this.showResolveForm.set(false);
         this.busy.set(false);
+        this.toasts.success(
+          `Verdict published — ${enumLabel(action).toLowerCase()}`,
+          this.resolveAmount
+            ? `${formatRupees(this.resolveAmount)} awarded. Both parties have been notified and the ticket is now resolved.`
+            : 'Both parties have been notified. The ticket sits in Resolved until you close it.'
+        );
         this.reload();
       },
-      error: e => { this.actionError.set(describeError(e, 'this ticket')); this.busy.set(false); }
+      error: e => { this.actionError.set(describeActionError(e, 'publishing this verdict')); this.busy.set(false); }
     });
   }
 
@@ -534,8 +685,13 @@ export class ComplaintsComponent {
     if (!s) return;
     this.busy.set(true);
     this.service.close(s.id).subscribe({
-      next: updated => { this.selected.set(updated); this.busy.set(false); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'this ticket')); this.busy.set(false); }
+      next: updated => {
+        this.selected.set(updated);
+        this.busy.set(false);
+        this.toasts.success('Ticket closed', `"${s.subject}" is closed for good and cannot be reopened by the customer.`);
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'closing this ticket')); this.busy.set(false); }
     });
   }
 }
