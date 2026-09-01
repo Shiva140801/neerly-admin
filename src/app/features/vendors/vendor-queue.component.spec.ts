@@ -27,7 +27,9 @@ describe('VendorQueueComponent', () => {
     totalOrders: 0,
     joinedAt: '2026-04-22T10:00:00Z',
     approvedAt: null,
-    servicedPincodes: ['500032', '500081']
+    servicedPincodes: ['500032', '500081'],
+    ownerName: 'Ramesh Kumar',
+    ownerPhone: '+919999900001',
   };
 
   beforeEach(async () => {
@@ -54,7 +56,9 @@ describe('VendorQueueComponent', () => {
     expect(service.list).toHaveBeenCalledWith('PENDING_VERIFICATION');
     const host: HTMLElement = fixture.nativeElement;
     expect(host.textContent).toContain('Sri Ganesh Water Supply');
-    expect(host.textContent).toContain('TIER_1');
+    // The tier pill reads in English; the raw enum stays on the title attribute.
+    expect(host.textContent).toContain('Tier 1');
+    expect(host.querySelector('[title="TIER_1"]')).not.toBeNull();
     expect(host.textContent).toContain('500032');
   });
 

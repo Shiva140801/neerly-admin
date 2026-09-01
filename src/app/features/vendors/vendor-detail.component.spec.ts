@@ -27,7 +27,9 @@ describe('VendorDetailComponent', () => {
     totalOrders: 0,
     joinedAt: '2026-04-22T10:00:00Z',
     approvedAt: null,
-    servicedPincodes: ['500032', '500081']
+    servicedPincodes: ['500032', '500081'],
+    ownerName: 'Ramesh Kumar',
+    ownerPhone: '+919999900001',
   };
 
   const activeVendor: VendorResponse = {
@@ -66,15 +68,21 @@ describe('VendorDetailComponent', () => {
     create();
     const host: HTMLElement = fixture.nativeElement;
     expect(host.textContent).toContain('Sri Ganesh Water Supply');
-    expect(host.querySelector('.pill.tier')?.textContent).toContain('TIER_1');
-    expect(host.querySelector('.pill.status')?.textContent).toContain('PENDING_VERIFICATION');
+    // Pills read in English; the raw enum stays available on the title attribute
+    // so an operator can still quote the wire value in a support ticket.
+    const tier = host.querySelector('.pill.tier');
+    const status = host.querySelector('.pill.status');
+    expect(tier?.textContent).toContain('Tier 1');
+    expect(tier?.getAttribute('title')).toBe('TIER_1');
+    expect(status?.textContent).toContain('Awaiting verification');
+    expect(status?.getAttribute('title')).toBe('PENDING_VERIFICATION');
   });
 
   it('renders business details from response', () => {
     create();
     const host: HTMLElement = fixture.nativeElement;
     expect(host.textContent).toContain('Ramesh');
-    expect(host.textContent).toContain('PROPRIETOR');
+    expect(host.textContent).toContain('Sole proprietor');
     expect(host.textContent).toContain('500032');
     expect(host.textContent).toContain('500081');
     expect(host.textContent).toContain('12345678901234');
@@ -90,10 +98,21 @@ describe('VendorDetailComponent', () => {
   it('clicking Approve calls service.approve and updates state', () => {
     service.approve.and.returnValue(of(activeVendor));
     create();
+    // Approve puts a business in front of customers, so it goes through the
+    // confirmation gate first — the click opens it, confirming runs the call.
     (fixture.nativeElement.querySelector('button.primary') as HTMLButtonElement).click();
+    fixture.detectChanges();
+    expect(component.confirm()?.confirmLabel).toBe('Approve and go live');
+    expect(service.approve).not.toHaveBeenCalled();
+
+    // The screen re-reads the vendor afterwards: mutation responses carry the
+    // new status but not the derived track record.
+    service.get.and.returnValue(of(activeVendor));
+    component.runConfirmed({ reason: '', amount: null });
     fixture.detectChanges();
 
     expect(service.approve).toHaveBeenCalledWith('v-1', {});
+    expect(service.get).toHaveBeenCalledTimes(2);
     expect(component.vendor()?.status).toBe('ACTIVE');
   });
 
@@ -138,6 +157,7 @@ describe('VendorDetailComponent', () => {
     create(activeVendor);
 
     component.suspendReason = 'Three consecutive customer complaints';
+    service.get.and.returnValue(of({ ...activeVendor, status: 'SUSPENDED' as const }));
     component.suspend();
 
     expect(service.suspend).toHaveBeenCalledWith('v-1', { reason: 'Three consecutive customer complaints' });

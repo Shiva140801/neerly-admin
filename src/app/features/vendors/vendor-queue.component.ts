@@ -5,12 +5,14 @@ import { RouterLink } from '@angular/router';
 import { VendorService } from './vendor.service';
 import type { VendorResponse, VendorStatus } from './vendor.model';
 import { describeError } from '../../shared/api-error';
+import { label as enumLabel, shortLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { CountPipe, WhenPipe } from '../../shared/ui/format.pipe';
 import {
   Severity, daysUntilDate, expiryLabel, expirySeverity, formatDuration,
-  humanize, msSince, waitSeverity
+  msSince, waitSeverity
 } from '../../shared/ui/urgency';
 
 /** A vendor row with everything the admin needs to decide without opening it. */
@@ -41,11 +43,10 @@ interface QueueRow {
 @Component({
   selector: 'app-vendor-queue',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterLink, PageHeaderComponent, DataStateComponent],
+  imports: [CommonModule, FormsModule, RouterLink, PageHeaderComponent, DataStateComponent, WhenPipe, CountPipe],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
-    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
 
     .wait { display: flex; flex-direction: column; gap: 2px; }
     .wait .big { font-size: 14px; font-weight: 750; font-variant-numeric: tabular-nums; color: var(--ink-900); }
@@ -61,13 +62,6 @@ interface QueueRow {
     .rating.crit { color: var(--err); }
     .rating.warn { color: var(--warn); }
 
-    .lede {
-      padding: 12px 16px; border-radius: var(--r-md); margin-bottom: 16px;
-      font-size: 13px; line-height: 1.5; font-weight: 600;
-    }
-    .lede.crit { background: var(--err-soft); color: var(--err-ink); }
-    .lede.warn { background: var(--warn-soft); color: var(--warn-ink); }
-    .lede.ok   { background: var(--ok-soft);  color: var(--ok-ink); }
 
     .crit-text { color: var(--err); font-weight: 650; }
     .warn-text { color: var(--warn); font-weight: 650; }
@@ -77,13 +71,13 @@ interface QueueRow {
       title="Vendor" accent="desk"
       [subtitle]="isQueue()
         ? 'Applications waiting on a decision — longest wait first. Every day here is supply you have won but cannot sell through.'
-        : 'Live and off-boarded vendors. Rating and licence health, per PRD §12.4 thresholds.'">
+        : 'Live and off-boarded vendors. A rating under 3.5★ flags a vendor for review; under 3.0★ suspends them automatically.'">
       <button type="button" class="btn btn--ghost btn--sm" (click)="reload()" [disabled]="loading()">
         {{ loading() ? 'Refreshing…' : 'Refresh' }}
       </button>
     </app-page-header>
 
-    <div class="toolbar">
+    <div class="toolbar toolbar--split">
       <div class="chips">
         @for (s of statuses; track s) {
           <button type="button" class="chip" [class.active]="selectedStatus() === s"
@@ -136,14 +130,14 @@ interface QueueRow {
                             [class.warn]="r.waitSeverity === 'warn'">
                         {{ r.waitedMs !== null ? dur(r.waitedMs) : '—' }}
                       </span>
-                      <span class="when">since {{ r.vendor.joinedAt | date:'d MMM, HH:mm' }}</span>
+                      <span class="when">since {{ r.vendor.joinedAt | when }}</span>
                     </span>
                   } @else {
                     <span class="pill"
                           [class.pill--ok]="r.vendor.status === 'ACTIVE'"
                           [class.pill--crit]="r.vendor.status === 'SUSPENDED' || r.vendor.status === 'TIER_3_REJECTED'"
                           [class.pill--mute]="r.vendor.status !== 'ACTIVE' && r.vendor.status !== 'SUSPENDED' && r.vendor.status !== 'TIER_3_REJECTED'">
-                      {{ r.vendor.status }}
+                      {{ shortLabelFor(r.vendor.status) }}
                     </span>
                   }
                 </td>
@@ -196,9 +190,10 @@ interface QueueRow {
                 <td class="right num">
                   @if (isQueue()) {
                     <span class="pill" [class.pill--brand]="r.vendor.tier === 'TIER_1'"
-                          [class.pill--info]="r.vendor.tier !== 'TIER_1'">{{ r.vendor.tier }}</span>
+                          [class.pill--info]="r.vendor.tier !== 'TIER_1'"
+                          [title]="r.vendor.tier">{{ shortLabelFor(r.vendor.tier) }}</span>
                   } @else {
-                    {{ r.vendor.totalOrders | number }}
+                    {{ r.vendor.totalOrders | count }}
                   }
                 </td>
 
@@ -319,7 +314,8 @@ export class VendorQueueComponent {
     return s.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
   }
 
-  humanized(v: string) { return humanize(v); }
+  humanized(v: string) { return enumLabel(v); }
+  shortLabelFor(v: string) { return shortLabel(v); }
   dur(ms: number) { return formatDuration(ms); }
   expiry(days: number | null) { return expiryLabel(days); }
 

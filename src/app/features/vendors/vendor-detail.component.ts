@@ -4,11 +4,17 @@ import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 import { VendorService } from './vendor.service';
 import type { VendorResponse } from './vendor.model';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { label as enumLabel, shortLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { CountPipe, WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
-  Severity, daysUntilDate, expiryLabel, expirySeverity, formatDuration, humanize, msSince
+  ConfirmDialogComponent, ConfirmRequest, ConfirmResult
+} from '../../shared/ui/confirm-dialog.component';
+import {
+  Severity, daysUntilDate, expiryLabel, expirySeverity, formatDuration, msSince
 } from '../../shared/ui/urgency';
 
 /**
@@ -25,7 +31,7 @@ import {
 @Component({
   selector: 'app-vendor-detail',
   standalone: true,
-  imports: [CommonModule, FormsModule, RouterLink, PageHeaderComponent],
+  imports: [CommonModule, FormsModule, RouterLink, PageHeaderComponent, ConfirmDialogComponent, WhenPipe, CountPipe],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
@@ -84,23 +90,23 @@ import {
             <div class="panel-head">
               <h2>Application</h2>
               <span class="row-flex gap-6">
-                <span class="pill pill--brand tier">{{ v.tier }}</span>
-                <span class="pill status"
+                <span class="pill pill--brand tier" [title]="v.tier">{{ human(v.tier) }}</span>
+                <span class="pill status" [title]="v.status"
                       [class.pill--ok]="v.status === 'ACTIVE'"
                       [class.pill--crit]="v.status === 'SUSPENDED' || v.status === 'TIER_3_REJECTED'"
                       [class.pill--warn]="v.status === 'PENDING_VERIFICATION' || v.status === 'APPLIED' || v.status === 'FSSAI_FILING'">
-                  {{ v.status }}
+                  {{ human(v.status) }}
                 </span>
               </span>
             </div>
             <div class="panel-body">
               <dl class="kv">
                 <dt>Proprietor</dt><dd>{{ v.proprietorName }}</dd>
-                <dt>Business type</dt><dd class="mono">{{ v.businessType }}</dd>
+                <dt>Business type</dt><dd [title]="v.businessType">{{ human(v.businessType) }}</dd>
                 <dt>Categories</dt>
                 <dd>
                   <span class="chip-list">
-                    @for (c of v.categories; track c) { <span class="pill pill--vend">{{ c }}</span> }
+                    @for (c of v.categories; track c) { <span class="pill pill--vend" [title]="c">{{ human(c) }}</span> }
                     @if (!v.categories.length) { <span class="muted">none declared</span> }
                   </span>
                 </dd>
@@ -116,9 +122,9 @@ import {
                   }
                 </dd>
                 <dt>Submitted</dt>
-                <dd>{{ v.joinedAt | date:'d MMM y, HH:mm' }} <span class="muted">· {{ waitedLabel() }}</span></dd>
+                <dd>{{ v.joinedAt | when }} <span class="muted">· {{ waitedLabel() }}</span></dd>
                 @if (v.approvedAt) {
-                  <dt>Approved</dt><dd>{{ v.approvedAt | date:'d MMM y, HH:mm' }}</dd>
+                  <dt>Approved</dt><dd>{{ v.approvedAt | when }}</dd>
                 }
               </dl>
             </div>
@@ -141,11 +147,12 @@ import {
                   @else { <span class="pill pill--crit">Not on file</span> }
                 </dd>
                 <dt>Expires</dt>
-                <dd>{{ v.fssaiExpiresAt ? (v.fssaiExpiresAt | date:'d MMM y') : '—' }}</dd>
+                <dd>{{ v.fssaiExpiresAt | when:'date' }}</dd>
               </dl>
               <p class="text-meta mt-12" style="line-height:1.55;">
-                Expiry day auto-blocks this vendor from accepting orders. Reminders go out at 60, 30 and 7 days —
-                the per-document upload history lives on the vendor's own compliance screen, not on this payload.
+                Expiry day auto-blocks this vendor from accepting orders, and reminders go out at 60, 30 and 7 days.
+                The uploaded documents behind this date — and the approve/reject controls for them — are on the
+                <a class="link" routerLink="/compliance">compliance watch</a>.
               </p>
             </div>
           </div>
@@ -158,7 +165,10 @@ import {
             @if (v.status === 'PENDING_VERIFICATION' || v.status === 'FSSAI_FILING') {
               <div class="action-block">
                 <p>Approving lets this vendor go live and start receiving routed orders immediately.</p>
-                <button type="button" class="btn btn--ok primary" (click)="approve()" [disabled]="busy()">
+                <!-- Approve puts a business in front of customers. It went
+                     through on one click while cancelling a ₹385 order demanded
+                     a typed reason; it now states its consequence first. -->
+                <button type="button" class="btn btn--ok primary" (click)="askApprove()" [disabled]="busy()">
                   {{ busy() ? 'Working…' : 'Approve vendor' }}
                 </button>
               </div>
@@ -177,12 +187,30 @@ import {
 
             @if (v.status === 'ACTIVE') {
               <div class="action-block">
-                <p>Suspension stops routing to this vendor at once. Open orders are unaffected.</p>
+                <p>Suspension stops routing to this vendor at once. Open orders are unaffected, and it can be
+                   lifted from this same panel.</p>
                 <label class="field-label" for="vd-suspend">Reason</label>
                 <textarea id="vd-suspend" class="input" [(ngModel)]="suspendReason"
                           placeholder="Why they are being taken off the platform."></textarea>
                 <button type="button" class="btn btn--danger warn mt-8" (click)="suspend()"
                         [disabled]="busy() || !suspendReason.trim()">Suspend vendor</button>
+              </div>
+            }
+
+            <!-- Suspension was a one-way door in the UI even though the backend
+                 has always had a way back. With one live vendor in the city, one
+                 click ended all supply with no route out. -->
+            @if (v.status === 'SUSPENDED') {
+              <div class="action-block">
+                <p>
+                  This vendor is suspended: nothing is being routed to them. Reinstating puts them straight back
+                  into routing{{ suspendedSupplyNote() }}
+                </p>
+                <label class="field-label" for="vd-reinstate">Reason</label>
+                <textarea id="vd-reinstate" class="input" [(ngModel)]="reinstateReason"
+                          placeholder="What changed since the suspension. Written to the audit log."></textarea>
+                <button type="button" class="btn btn--ok reinstate mt-8" (click)="askReinstate()"
+                        [disabled]="busy() || !reinstateReason.trim()">Reinstate vendor</button>
               </div>
             }
 
@@ -194,7 +222,7 @@ import {
             <div class="stat-row">
               <div class="stat">
                 <div class="k">Orders</div>
-                <div class="v">{{ v.totalOrders | number }}</div>
+                <div class="v">{{ v.totalOrders | count }}</div>
                 <div class="n">lifetime, all statuses</div>
               </div>
               <div class="stat">
@@ -215,6 +243,29 @@ import {
             </div>
           </div>
 
+          @if (fssaiSeverity() === 'crit' || fssaiSeverity() === 'warn') {
+            <div class="panel" id="renewal">
+              <div class="panel-head"><h2>Renewal</h2></div>
+              <div class="action-block">
+                <p>
+                  <strong>{{ expiry(fssaiDays()) }}.</strong>
+                  On the expiry date this vendor stops being routed orders automatically. FSSAI turnaround is not
+                  same-week, so a renewal started today is already tight.
+                </p>
+                <p>
+                  The portal has no phone number, email address or outbound message for a vendor — no admin
+                  endpoint exposes vendor contact details, so chasing has to happen on whatever channel you
+                  already use with them. What the portal can do is show you the moment a renewal lands.
+                </p>
+                <a class="btn btn--ghost" routerLink="/compliance">Watch for the renewal upload</a>
+                <a class="btn btn--ghost mt-8" [routerLink]="['/audit']"
+                   [queryParams]="{ targetEntityType: 'VENDOR', targetEntityId: v.id }">
+                  What has already been chased
+                </a>
+              </div>
+            </div>
+          }
+
           <div class="panel">
             <div class="panel-head"><h2>Audit</h2></div>
             <div class="action-block">
@@ -225,6 +276,9 @@ import {
           </div>
         </div>
       </div>
+
+      <app-confirm-dialog [request]="confirm()" [busy]="busy()"
+                          (confirmed)="runConfirmed($event)" (cancelled)="confirm.set(null)" />
     } @else if (loading()) {
       <div class="panel">
         <div class="panel-body"><span class="text-label">Loading vendor…</span></div>
@@ -244,6 +298,7 @@ export class VendorDetailComponent implements OnInit {
 
   private service = inject(VendorService);
   private clock = inject(ClockService);
+  private toasts = inject(ToastService);
 
   vendor = signal<VendorResponse | null>(null);
   loading = signal(false);
@@ -252,6 +307,10 @@ export class VendorDetailComponent implements OnInit {
   actionError = signal<string | null>(null);
   rejectReason = '';
   suspendReason = '';
+  reinstateReason = '';
+
+  confirm = signal<ConfirmRequest | null>(null);
+  private pending: (() => void) | null = null;
 
   ngOnInit() { this.reload(); }
 
@@ -294,7 +353,7 @@ export class VendorDetailComponent implements OnInit {
       if (days !== null && days <= 30) {
         return { severity: 'warn', text: `Paperwork is complete, but the FSSAI licence lapses in ${days} day${days === 1 ? '' : 's'} — approving now buys very little runway.` };
       }
-      return { severity: 'ok', text: 'Everything this endpoint can check is complete. Safe to approve.' };
+      return { severity: 'ok', text: 'Licence, service area and categories are all on file. Nothing is blocking approval.' };
     }
 
     if (v.status === 'ACTIVE') {
@@ -310,11 +369,65 @@ export class VendorDetailComponent implements OnInit {
       return { severity: 'ok', text: 'Live and healthy — rating and licence both clear their thresholds.' };
     }
 
-    return { severity: 'warn', text: `Currently ${humanize(v.status)}. No decision is pending from you.` };
+    if (v.status === 'SUSPENDED') {
+      return { severity: 'crit', text: 'Suspended — nothing is being routed to this vendor. Reinstate from the decision panel when the reason is resolved.' };
+    }
+    return { severity: 'warn', text: `Currently ${enumLabel(v.status).toLowerCase()}. No decision is pending from you.` };
   });
 
-  human(v: string) { return humanize(v); }
+  human(v: string) { return shortLabel(v); }
+
+  /** Named so the reinstate copy can say what supply is currently missing. */
+  suspendedSupplyNote(): string {
+    const v = this.vendor();
+    return v && v.servicedPincodes.length
+      ? `, covering ${v.servicedPincodes.length} pincode${v.servicedPincodes.length === 1 ? '' : 's'} again.`
+      : '.';
+  }
+
+  askApprove() {
+    const v = this.vendor();
+    if (!v) return;
+    this.confirm.set({
+      title: 'Approve this vendor',
+      message: `${v.businessName} goes live and starts receiving routed orders immediately.`,
+      confirmLabel: 'Approve and go live',
+      tone: 'ok',
+      consequence: `Customers in ${v.servicedPincodes.length} pincode${v.servicedPincodes.length === 1 ? '' : 's'} can order from them from this moment. Suspending later stops routing but does not undo orders already placed.`
+    });
+    this.pending = () => this.approve();
+  }
+
+  askReinstate() {
+    const v = this.vendor();
+    if (!v || !this.reinstateReason.trim()) return;
+    this.confirm.set({
+      title: 'Reinstate this vendor',
+      message: `${v.businessName} goes back into routing and can accept orders again straight away.`,
+      confirmLabel: 'Reinstate vendor',
+      tone: 'ok',
+      consequence: 'Whatever the suspension was for is no longer blocking them. Your reason goes to the append-only audit log.'
+    });
+    this.pending = () => this.reinstate();
+  }
+
+  runConfirmed(_result: ConfirmResult) {
+    const run = this.pending;
+    this.confirm.set(null);
+    this.pending = null;
+    run?.();
+  }
   expiry(days: number | null) { return this.vendor()?.fssaiNumber ? expiryLabel(days) : 'no licence on file'; }
+
+  /**
+   * Re-reads the vendor after a change.
+   *
+   * The approve/reject/suspend/reinstate responses carry the new status but not
+   * the derived track record — `totalOrders` comes back 0 on those paths and 39
+   * on `GET /admin/vendors/{id}`. Trusting the mutation response therefore made
+   * a vendor with 39 orders look brand new the instant you acted on them.
+   */
+  private reconcile() { this.reload(); }
 
   private reload() {
     this.loading.set(true);
@@ -329,8 +442,33 @@ export class VendorDetailComponent implements OnInit {
     this.busy.set(true);
     this.actionError.set(null);
     this.service.approve(this.id, {}).subscribe({
-      next: v => { this.vendor.set(v); this.busy.set(false); },
-      error: e => { this.actionError.set(describeError(e, 'this vendor')); this.busy.set(false); }
+      next: v => {
+        this.vendor.set(v);
+        this.busy.set(false);
+        this.reconcile();
+        this.toasts.success(
+          `${v.businessName} is live`,
+          `Orders in ${v.servicedPincodes.length} pincode${v.servicedPincodes.length === 1 ? '' : 's'} can now be routed to them.`
+        );
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'approving this vendor')); this.busy.set(false); }
+    });
+  }
+
+  reinstate() {
+    const reason = this.reinstateReason.trim();
+    if (!reason) return;
+    this.busy.set(true);
+    this.actionError.set(null);
+    this.service.reinstate(this.id, { reason }).subscribe({
+      next: v => {
+        this.vendor.set(v);
+        this.reinstateReason = '';
+        this.busy.set(false);
+        this.reconcile();
+        this.toasts.success(`${v.businessName} is back in routing`, 'They can accept orders again from now.');
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'reinstating this vendor')); this.busy.set(false); }
     });
   }
 
@@ -339,8 +477,14 @@ export class VendorDetailComponent implements OnInit {
     this.busy.set(true);
     this.actionError.set(null);
     this.service.reject(this.id, { reason: this.rejectReason.trim() }).subscribe({
-      next: v => { this.vendor.set(v); this.rejectReason = ''; this.busy.set(false); },
-      error: e => { this.actionError.set(describeError(e, 'this vendor')); this.busy.set(false); }
+      next: v => {
+        this.vendor.set(v);
+        this.rejectReason = '';
+        this.busy.set(false);
+        this.reconcile();
+        this.toasts.success('Application rejected', `${v.businessName} sees your reason and can resubmit. Three rejections is permanent.`);
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'rejecting this application')); this.busy.set(false); }
     });
   }
 
@@ -349,8 +493,17 @@ export class VendorDetailComponent implements OnInit {
     this.busy.set(true);
     this.actionError.set(null);
     this.service.suspend(this.id, { reason: this.suspendReason.trim() }).subscribe({
-      next: v => { this.vendor.set(v); this.suspendReason = ''; this.busy.set(false); },
-      error: e => { this.actionError.set(describeError(e, 'this vendor')); this.busy.set(false); }
+      next: v => {
+        this.vendor.set(v);
+        this.suspendReason = '';
+        this.busy.set(false);
+        this.reconcile();
+        this.toasts.success(
+          `${v.businessName} suspended`,
+          'Nothing more is being routed to them. Reinstate from this same panel when it is resolved.'
+        );
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'suspending this vendor')); this.busy.set(false); }
     });
   }
 }

@@ -22,6 +22,9 @@ export interface VendorResponse {
   joinedAt: string;
   approvedAt: string | null;
   servicedPincodes: string[];
+  /** How to reach the vendor. Null until the backend can resolve the owner. */
+  ownerName: string | null;
+  ownerPhone: string | null;
 }
 
 export interface ApproveVendorRequest {
@@ -35,4 +38,9 @@ export interface RejectVendorRequest {
 export interface SuspendVendorRequest {
   reason: string;
   untilIso?: string;
+}
+
+/** Suspension is not a one-way door: `POST /admin/vendors/{id}/reinstate` undoes it. */
+export interface ReinstateVendorRequest {
+  reason: string;
 }

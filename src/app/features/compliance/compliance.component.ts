@@ -6,14 +6,18 @@ import { catchError, map } from 'rxjs/operators';
 import { ApiClient, Page } from '../../core/api/api-client';
 import type { ComplianceDoc } from '../../shared/attention.service';
 import type { VendorResponse } from '../vendors/vendor.model';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { label as enumLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
+import { EvidenceStripComponent } from '../../shared/ui/evidence-strip.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { CountPipe, WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
   ConfirmDialogComponent, ConfirmRequest, ConfirmResult
 } from '../../shared/ui/confirm-dialog.component';
-import { Severity, daysUntilDate, expirySeverity, humanize } from '../../shared/ui/urgency';
+import { Severity, daysUntilDate, expirySeverity } from '../../shared/ui/urgency';
 
 interface VendorLicence {
   vendor: VendorResponse;
@@ -51,19 +55,14 @@ const HORIZONS = [7, 30, 60] as const;
 @Component({
   selector: 'app-compliance',
   standalone: true,
-  imports: [CommonModule, RouterLink, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
+  imports: [
+    CommonModule, RouterLink, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent,
+    EvidenceStripComponent, WhenPipe, CountPipe
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
-    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
 
-    .lede {
-      padding: 12px 16px; border-radius: var(--r-md); margin-bottom: 18px;
-      font-size: 13px; line-height: 1.5; font-weight: 600;
-    }
-    .lede.crit { background: var(--err-soft);  color: var(--err-ink); }
-    .lede.warn { background: var(--warn-soft); color: var(--warn-ink); }
-    .lede.ok   { background: var(--ok-soft);   color: var(--ok-ink); }
 
     .countdown { display: flex; align-items: baseline; gap: 6px; }
     .countdown .n {
@@ -101,8 +100,9 @@ const HORIZONS = [7, 30, 60] as const;
       </button>
     </app-page-header>
 
-    <div class="toolbar">
+    <div class="toolbar toolbar--split">
       <div class="chips">
+        <span class="text-label" style="margin-right:2px;">Licence window</span>
         @for (h of horizons; track h) {
           <button type="button" class="chip" [class.active]="horizon() === h" (click)="horizon.set(h)">
             Next {{ h }} days
@@ -122,7 +122,9 @@ const HORIZONS = [7, 30, 60] as const;
     <div class="panel">
       <div class="panel-head">
         <h2>Vendor licences · who gets blocked</h2>
-        <span class="text-label">{{ licences().length }} inside {{ horizon() }} days</span>
+        <span class="text-label">
+          {{ loading() ? 'still counting…' : licences().length + ' inside ' + horizon() + ' days' }}
+        </span>
       </div>
 
       @if (loading() || vendorError() || licences().length === 0) {
@@ -142,7 +144,7 @@ const HORIZONS = [7, 30, 60] as const;
                 <th>Vendor</th>
                 <th>FSSAI number</th>
                 <th>Expires</th>
-                <th class="right">Live orders</th>
+                <th class="right">Orders served</th>
                 <th></th>
               </tr>
             </thead>
@@ -164,12 +166,23 @@ const HORIZONS = [7, 30, 60] as const;
                   <td>
                     <div class="primary-cell">{{ l.vendor.businessName }}</div>
                     <div class="sub-cell">{{ l.vendor.proprietorName }} · {{ l.vendor.businessPincode }}</div>
+                    <!-- Chasing a renewal means phoning someone. Without a number on the
+                         row the operator had to go hunting, so the CTA dead-ended. -->
+                    @if (l.vendor.ownerPhone; as phone) {
+                      <div class="sub-cell">
+                        <a class="link" [href]="'tel:' + phone">{{ phone }}</a>
+                        @if (l.vendor.ownerName) { <span> · {{ l.vendor.ownerName }}</span> }
+                      </div>
+                    }
                   </td>
                   <td class="mono" style="font-size:12px;">{{ l.vendor.fssaiNumber ?? '—' }}</td>
-                  <td>{{ l.vendor.fssaiExpiresAt ? (l.vendor.fssaiExpiresAt | date:'d MMM y') : '—' }}</td>
-                  <td class="right num">{{ l.vendor.totalOrders | number }}</td>
+                  <td>{{ l.vendor.fssaiExpiresAt | when:'date' }}</td>
+                  <td class="right num">{{ l.vendor.totalOrders | count }}</td>
                   <td class="right">
-                    <a class="link" [routerLink]="['/vendors', l.vendor.id]">Open vendor →</a>
+                    <!-- "Chase renewal" used to dead-end. It now lands on the one
+                         page that holds everything needed to act on this vendor. -->
+                    <a class="link" [routerLink]="['/vendors', l.vendor.id]"
+                       [fragment]="'renewal'">Chase renewal →</a>
                   </td>
                 </tr>
               }
@@ -186,7 +199,7 @@ const HORIZONS = [7, 30, 60] as const;
     <div class="panel mt-24">
       <div class="panel-head">
         <h2>Uploaded documents near expiry</h2>
-        <span class="text-label">{{ docs().length }} on file</span>
+        <span class="text-label">{{ loading() ? 'still counting…' : docs().length + ' on file' }}</span>
       </div>
 
       @if (loading() || docError() || docs().length === 0) {
@@ -206,6 +219,7 @@ const HORIZONS = [7, 30, 60] as const;
                 <th>Document</th>
                 <th>Vendor</th>
                 <th>Number</th>
+                <th>The file</th>
                 <th>Uploaded</th>
                 <th>Status</th>
                 <th class="right">Review</th>
@@ -233,7 +247,17 @@ const HORIZONS = [7, 30, 60] as const;
                     }
                   </td>
                   <td class="mono" style="font-size:12px;">{{ d.doc.docNumber ?? '—' }}</td>
-                  <td>{{ d.doc.uploadedAt | date:'d MMM y' }}</td>
+                  <!-- You are being asked to approve a licence. The document
+                       itself has to be openable, or the approval is a rubber
+                       stamp on a filename. -->
+                  <td style="min-width:150px;">
+                    @if (d.doc.s3Key) {
+                      <app-evidence-strip [keys]="[d.doc.s3Key]" />
+                    } @else {
+                      <span class="pill pill--crit">No file uploaded</span>
+                    }
+                  </td>
+                  <td>{{ d.doc.uploadedAt | when:'date' }}</td>
                   <td>
                     <span class="pill"
                           [class.pill--warn]="d.doc.status === 'SUBMITTED'"
@@ -251,7 +275,7 @@ const HORIZONS = [7, 30, 60] as const;
                                 [disabled]="busyId() === d.doc.id">Reject</button>
                       </span>
                     } @else {
-                      <span class="muted">reviewed {{ d.doc.reviewedAt ? (d.doc.reviewedAt | date:'d MMM') : '—' }}</span>
+                      <span class="muted">reviewed {{ d.doc.reviewedAt ? (d.doc.reviewedAt | when:'date') : '—' }}</span>
                     }
                   </td>
                 </tr>
@@ -263,13 +287,18 @@ const HORIZONS = [7, 30, 60] as const;
       <div class="note">
         This lens covers <strong>every document type</strong> a vendor has uploaded — trade licence, groundwater
         permit, shop establishment — not just FSSAI, and it is the only place a submitted renewal can be approved
-        or rejected. The licence table above stays because a vendor's <code>fssaiExpiresAt</code> is what actually
-        triggers the auto-block, and it is set whether or not a document was ever uploaded against it.
+        or rejected. The table above stays separate because the expiry date held on the vendor's own record is
+        what triggers the auto-block, and a vendor can carry one whether or not they ever uploaded a document
+        against it.
       </div>
     </div>
 
     @if (actionError(); as e) {
-      <div class="lede crit mt-16">{{ e }}</div>
+      <div class="lede crit mt-16" role="alert">
+        {{ e }}
+        <button type="button" class="btn btn--ghost btn--sm" style="margin-left:10px;"
+                (click)="actionError.set(null)">Dismiss</button>
+      </div>
     }
 
     <app-confirm-dialog [request]="confirm()" [busy]="busyId() !== null"
@@ -279,6 +308,7 @@ const HORIZONS = [7, 30, 60] as const;
 export class ComplianceComponent {
   private api = inject(ApiClient);
   private clock = inject(ClockService);
+  private toasts = inject(ToastService);
 
   horizons = HORIZONS;
   horizon = signal<number>(30);
@@ -297,7 +327,7 @@ export class ComplianceComponent {
 
   constructor() { this.reload(); }
 
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
 
   /** All live vendors with a dated licence, soonest first — independent of the horizon chip. */
   private allLicences = computed<VendorLicence[]>(() => {
@@ -334,10 +364,20 @@ export class ComplianceComponent {
     return Math.max(3, Math.min(100, Math.round((days / 60) * 100)));
   }
 
+  /**
+   * The headline has to answer for *both* tables on this screen.
+   *
+   * It used to read only the vendor records, so it could announce "no live
+   * vendor loses their licence inside 30 days" directly above an uploaded
+   * document expiring in 16 — the two dates come from different rows and can
+   * disagree until a renewal is approved. Where they disagree, the sooner one
+   * wins, because that is the one that can actually stop supply.
+   */
   readonly lede = computed<{ severity: Severity; text: string }>(() => {
     const critical = this.allLicences().filter(l => (l.days ?? 99) <= 7);
     const soon = this.allLicences().filter(l => (l.days ?? 99) > 7 && (l.days ?? 99) <= 30);
     const expired = critical.filter(l => (l.days ?? 0) < 0);
+    const docsSoon = this.docs().filter(d => (d.days ?? 999) <= 30);
 
     if (expired.length) {
       return { severity: 'crit', text: `${expired.length} vendor${expired.length === 1 ? '' : 's'} ${expired.length === 1 ? 'is' : 'are'} already past licence expiry and blocked from selling — ${expired[0].vendor.businessName} first.` };
@@ -348,7 +388,14 @@ export class ComplianceComponent {
     if (soon.length) {
       return { severity: 'warn', text: `${soon.length} licence${soon.length === 1 ? '' : 's'} lapse${soon.length === 1 ? 's' : ''} inside 30 days. Chase renewals now — FSSAI turnaround is not same-week.` };
     }
-    return { severity: 'ok', text: 'No live vendor loses their licence inside the next 30 days.' };
+    if (docsSoon.length) {
+      const first = docsSoon[0];
+      return {
+        severity: 'warn',
+        text: `No vendor record shows a licence lapsing inside 30 days, but ${docsSoon.length} uploaded document${docsSoon.length === 1 ? '' : 's'} ${docsSoon.length === 1 ? 'does' : 'do'} — ${enumLabel(first.doc.docType)} for ${first.doc.vendorName ?? 'an unattributed vendor'}, in ${first.days} day${first.days === 1 ? '' : 's'}. Where the two disagree, treat the earlier date as the real one.`
+      };
+    }
+    return { severity: 'ok', text: 'No live vendor loses their licence inside the next 30 days, and no uploaded document is near expiry.' };
   });
 
   reload() {
@@ -375,7 +422,8 @@ export class ComplianceComponent {
   askApprove(d: ComplianceDoc) {
     this.confirm.set({
       title: 'Approve document',
-      message: `${humanize(d.docType)}${d.docNumber ? ` · ${d.docNumber}` : ''} is marked verified.`,
+      message: `${enumLabel(d.docType)}${d.docNumber ? ` · ${d.docNumber}` : ''} is marked verified${d.vendorName ? ` for ${d.vendorName}` : ''}.`,
+      consequence: 'Approving an expiry date writes it onto the vendor record, which is what the auto-block reads.',
       confirmLabel: 'Approve',
       tone: 'ok',
       reason: { label: 'Note (optional)', placeholder: 'Anything worth recording about this check.' }
@@ -386,7 +434,7 @@ export class ComplianceComponent {
   askReject(d: ComplianceDoc) {
     this.confirm.set({
       title: 'Reject document',
-      message: `${humanize(d.docType)}${d.docNumber ? ` · ${d.docNumber}` : ''} goes back to the vendor.`,
+      message: `${enumLabel(d.docType)}${d.docNumber ? ` · ${d.docNumber}` : ''} goes back to ${d.vendorName ?? 'the vendor'}.`,
       confirmLabel: 'Reject',
       tone: 'danger',
       reason: { label: 'Reason', placeholder: 'What is wrong with it, so they can resubmit correctly.', required: true },
@@ -405,8 +453,15 @@ export class ComplianceComponent {
   private approve(d: ComplianceDoc, note: string) {
     this.busyId.set(d.id);
     this.api.post(`/admin/compliance/${d.id}/approve`, { note }).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'the approval')); this.busyId.set(null); }
+      next: () => {
+        this.busyId.set(null);
+        this.toasts.success(
+          `${enumLabel(d.docType)} approved`,
+          `${d.vendorName ?? 'The vendor'} keeps selling. The expiry on this document is now the date the auto-block reads.`
+        );
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'approving this document')); this.busyId.set(null); }
     });
   }
 
@@ -415,8 +470,15 @@ export class ComplianceComponent {
     // RejectDocRequest expects `reason` — the previous build posted `note`,
     // which failed validation on the server.
     this.api.post(`/admin/compliance/${d.id}/reject`, { reason }).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'the rejection')); this.busyId.set(null); }
+      next: () => {
+        this.busyId.set(null);
+        this.toasts.success(
+          `${enumLabel(d.docType)} rejected`,
+          `${d.vendorName ?? 'The vendor'} sees your reason verbatim and has to upload a replacement before the licence expires.`
+        );
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'rejecting this document')); this.busyId.set(null); }
     });
   }
 }

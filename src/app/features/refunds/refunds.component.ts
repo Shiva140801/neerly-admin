@@ -3,14 +3,19 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ApiClient, Page } from '../../core/api/api-client';
 import type { AdminRefund } from '../../shared/attention.service';
-import { describeError } from '../../shared/api-error';
+import { describeActionError, describeError } from '../../shared/api-error';
+import { DirectoryService, unknownParty } from '../../shared/directory.service';
+import { label as enumLabel } from '../../shared/labels';
 import { ClockService } from '../../shared/ui/clock.service';
 import { DataStateComponent } from '../../shared/ui/data-state.component';
 import { PageHeaderComponent } from '../../shared/ui/page-header.component';
+import { formatRupees, formatWhen } from '../../shared/ui/format';
+import { RupeesPipe, WhenPipe } from '../../shared/ui/format.pipe';
+import { ToastService } from '../../shared/ui/toast.service';
 import {
   ConfirmDialogComponent, ConfirmRequest, ConfirmResult
 } from '../../shared/ui/confirm-dialog.component';
-import { MS_DAY, Severity, formatDuration, humanize, msSince } from '../../shared/ui/urgency';
+import { MS_DAY, MS_HOUR, Severity, formatDuration, msSince } from '../../shared/ui/urgency';
 
 type RefundStatus = AdminRefund['status'];
 
@@ -42,19 +47,14 @@ interface RefundRow {
 @Component({
   selector: 'app-refunds',
   standalone: true,
-  imports: [CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent],
+  imports: [
+    CommonModule, FormsModule, PageHeaderComponent, DataStateComponent, ConfirmDialogComponent,
+    WhenPipe, RupeesPipe
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   styles: [`
     :host { display: block; }
-    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
 
-    .lede {
-      padding: 12px 16px; border-radius: var(--r-md); margin-bottom: 16px;
-      font-size: 13px; line-height: 1.5; font-weight: 600;
-    }
-    .lede.crit { background: var(--err-soft);  color: var(--err-ink); }
-    .lede.warn { background: var(--warn-soft); color: var(--warn-ink); }
-    .lede.ok   { background: var(--ok-soft);   color: var(--ok-ink); }
 
     .age { font-weight: 750; font-variant-numeric: tabular-nums; font-size: 13.5px; color: var(--ink-800); }
     .age.crit { color: var(--err); }
@@ -72,7 +72,7 @@ interface RefundRow {
       </button>
     </app-page-header>
 
-    <div class="toolbar">
+    <div class="toolbar toolbar--split">
       <div class="chips">
         @for (s of statuses; track s) {
           <button type="button" class="chip" [class.active]="status() === s" (click)="status.set(s); reload()">
@@ -108,6 +108,7 @@ interface RefundRow {
             <tr>
               <th>{{ status() === 'REQUESTED' ? 'Waiting' : 'Requested' }}</th>
               <th class="right">Amount</th>
+              <th>Who asked</th>
               <th>Destination</th>
               <th>Reason given</th>
               <th>Order</th>
@@ -124,7 +125,11 @@ interface RefundRow {
                   </div>
                   <div class="sla">{{ r.slaLabel }}</div>
                 </td>
-                <td class="right"><span class="amt">₹{{ r.refund.amount | number:'1.2-2' }}</span></td>
+                <td class="right"><span class="amt">{{ r.refund.amount | rupees }}</span></td>
+                <td>
+                  <div class="primary-cell">{{ customerName(r.refund) ?? unknownCustomer(r.refund) }}</div>
+                  @if (vendorName(r.refund); as v) { <div class="sub-cell">order fulfilled by {{ v }}</div> }
+                </td>
                 <td>
                   <span class="pill"
                         [class.pill--ok]="r.refund.refundMode === 'WALLET'"
@@ -135,7 +140,10 @@ interface RefundRow {
                   <div class="sub-cell">{{ modeNote(r.refund.refundMode) }}</div>
                 </td>
                 <td class="reason">{{ r.refund.reason }}</td>
-                <td class="mono" style="font-size:12px;">{{ r.refund.orderId ? r.refund.orderId.slice(0, 8) : 'no order' }}</td>
+                <!-- The raw orderId cannot be reconciled with the NEE-… number on
+                     the board, so the human reference is shown wherever it can be
+                     resolved and the id is labelled as unresolved when it cannot. -->
+                <td class="mono" style="font-size:12px;">{{ orderRef(r.refund) }}</td>
                 <td>
                   <span class="pill"
                         [class.pill--warn]="r.refund.status === 'REQUESTED'"
@@ -146,7 +154,7 @@ interface RefundRow {
                   </span>
                   @if (r.refund.failureReason) { <div class="sub-cell">{{ r.refund.failureReason }}</div> }
                   @else if (r.refund.rejectionReason) { <div class="sub-cell">{{ r.refund.rejectionReason }}</div> }
-                  @else if (r.refund.completedAt) { <div class="sub-cell">{{ r.refund.completedAt | date:'d MMM, HH:mm' }}</div> }
+                  @else if (r.refund.completedAt) { <div class="sub-cell">{{ r.refund.completedAt | when }}</div> }
                 </td>
                 <td class="right">
                   @if (r.refund.status === 'REQUESTED') {
@@ -167,7 +175,13 @@ interface RefundRow {
       </div>
     }
 
-    @if (actionError(); as e) { <div class="lede crit mt-16">{{ e }}</div> }
+    @if (actionError(); as e) {
+      <div class="lede crit mt-16" role="alert">
+        {{ e }}
+        <button type="button" class="btn btn--ghost btn--sm" style="margin-left:10px;"
+                (click)="actionError.set(null)">Dismiss</button>
+      </div>
+    }
 
     <app-confirm-dialog [request]="confirm()" [busy]="busyId() !== null"
                         (confirmed)="runConfirmed($event)" (cancelled)="confirm.set(null)" />
@@ -176,6 +190,8 @@ interface RefundRow {
 export class RefundsComponent {
   private api = inject(ApiClient);
   private clock = inject(ClockService);
+  private toasts = inject(ToastService);
+  private directory = inject(DirectoryService);
 
   statuses = STATUSES;
   status = signal<RefundStatus>('REQUESTED');
@@ -188,10 +204,29 @@ export class RefundsComponent {
   confirm = signal<ConfirmRequest | null>(null);
   private pending: ((r: ConfirmResult) => void) | null = null;
 
-  constructor() { this.reload(); }
+  constructor() {
+    this.reload();
+    this.directory.ensureLoaded();
+  }
 
-  label(v: string) { return humanize(v); }
+  label(v: string) { return enumLabel(v); }
   dur(ms: number) { return formatDuration(ms); }
+
+  customerName(r: AdminRefund): string | null {
+    return r.customerName ?? this.directory.customerName(r.customerId);
+  }
+
+  vendorName(r: AdminRefund): string | null {
+    return r.vendorName ?? this.directory.order(r.orderId)?.vendorName ?? null;
+  }
+
+  unknownCustomer(r: AdminRefund) { return unknownParty('customer', r.customerId); }
+
+  /** The order number printed on the board, when it can be resolved. */
+  orderRef(r: AdminRefund): string {
+    if (!r.orderId) return 'no order';
+    return r.orderNumber ?? this.directory.orderNumber(r.orderId) ?? unknownParty('order', r.orderId);
+  }
 
   modeNote(mode: AdminRefund['refundMode']): string {
     switch (mode) {
@@ -208,10 +243,10 @@ export class RefundsComponent {
       .map(refund => {
         const ageMs = msSince(refund.requestedAt, now);
         let severity: Severity = 'ok';
-        let slaLabel = `requested ${refund.requestedAt.slice(0, 10)}`;
+        let slaLabel = `requested ${formatWhen(refund.requestedAt, 'date')}`;
         if (awaiting && ageMs !== null) {
           const left = MS_DAY - ageMs;
-          severity = left <= 0 ? 'crit' : left <= 6 * 3_600_000 ? 'warn' : 'ok';
+          severity = left <= 0 ? 'crit' : left <= 6 * MS_HOUR ? 'warn' : 'ok';
           slaLabel = left <= 0 ? `SLA blown by ${formatDuration(left)}` : `${formatDuration(left)} of SLA left`;
         }
         return { refund, ageMs, severity, slaLabel };
@@ -226,7 +261,7 @@ export class RefundsComponent {
   readonly lede = computed<{ severity: Severity; text: string }>(() => {
     const rows = this.rows();
     const blown = rows.filter(r => r.severity === 'crit').length;
-    const money = `₹${Math.round(this.exposure()).toLocaleString('en-IN')}`;
+    const money = formatRupees(Math.round(this.exposure()));
     if (blown) {
       return { severity: 'crit', text: `${blown} request${blown === 1 ? ' is' : 's are'} past the 24-hour SLA. ${money} held up across ${rows.length} request${rows.length === 1 ? '' : 's'}.` };
     }
@@ -253,7 +288,7 @@ export class RefundsComponent {
   askApprove(r: AdminRefund) {
     this.confirm.set({
       title: 'Approve refund',
-      message: `₹${Number(r.amount).toFixed(2)} back to the customer via ${humanize(r.refundMode)}.`,
+      message: `${formatRupees(r.amount)} back to ${this.customerName(r) ?? 'the customer'} via ${enumLabel(r.refundMode).toLowerCase()}.`,
       confirmLabel: 'Approve refund',
       tone: 'ok',
       reason: { label: 'Note (optional)', placeholder: 'Why you allowed it — useful when the same customer files again.' },
@@ -267,7 +302,7 @@ export class RefundsComponent {
   askReject(r: AdminRefund) {
     this.confirm.set({
       title: 'Reject refund',
-      message: `${r.customerId.slice(0, 8)} asked for ₹${Number(r.amount).toFixed(2)} — "${r.reason}".`,
+      message: `${this.customerName(r) ?? this.unknownCustomer(r)} asked for ${formatRupees(r.amount)} — "${r.reason}".`,
       confirmLabel: 'Reject request',
       tone: 'danger',
       reason: { label: 'Reason', placeholder: 'The customer sees this. Be specific — vague rejections come back as disputes.', required: true }
@@ -286,8 +321,17 @@ export class RefundsComponent {
     this.busyId.set(r.id);
     this.actionError.set(null);
     this.api.post(`/admin/refunds/${r.id}/approve`, { note }).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'the approval')); this.busyId.set(null); }
+      next: () => {
+        this.busyId.set(null);
+        this.toasts.success(
+          `Refund approved — ${formatRupees(r.amount)}`,
+          r.refundMode === 'WALLET'
+            ? `Credited to ${this.customerName(r) ?? 'the customer'}'s wallet immediately.`
+            : `On its way back to ${this.customerName(r) ?? 'the customer'} through the original payment rail.`
+        );
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'approving this refund')); this.busyId.set(null); }
     });
   }
 
@@ -296,8 +340,15 @@ export class RefundsComponent {
     this.actionError.set(null);
     // RejectRefundRequest requires `reason`; posting `note` failed validation.
     this.api.post(`/admin/refunds/${r.id}/reject`, { reason }).subscribe({
-      next: () => { this.busyId.set(null); this.reload(); },
-      error: e => { this.actionError.set(describeError(e, 'the rejection')); this.busyId.set(null); }
+      next: () => {
+        this.busyId.set(null);
+        this.toasts.success(
+          'Refund rejected',
+          `No money moved. ${this.customerName(r) ?? 'The customer'} sees your reason and can dispute it.`
+        );
+        this.reload();
+      },
+      error: e => { this.actionError.set(describeActionError(e, 'rejecting this refund')); this.busyId.set(null); }
     });
   }
 }
