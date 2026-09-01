@@ -21,7 +21,13 @@ import { ChangeDetectionStrategy, Component, Input } from '@angular/core';
     .sub {
       color: var(--ink-600); font-size: 13.5px; margin-top: 6px; max-width: 68ch;
     }
-    .actions { display: flex; align-items: center; gap: 8px; flex: none; padding-top: 6px; }
+    .actions { display: flex; align-items: center; gap: 8px; flex: none; padding-top: 6px; flex-wrap: wrap; }
+
+    @media (max-width: 620px) {
+      .bar { flex-direction: column; align-items: stretch; gap: 12px; }
+      h1 { font-size: 28px; }
+      .actions { padding-top: 0; }
+    }
   `],
   template: `
     <div class="bar">

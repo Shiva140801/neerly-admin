@@ -196,6 +196,51 @@ tr.sev-ok   td:first-child { box-shadow: inset 3px 0 0 var(--ok); }
 }
 .btn-admin:disabled { opacity: 0.45; cursor: not-allowed; }
 
+/* --- Screen furniture ---------------------------------------------------- */
+
+/*
+ * Every operational screen opens with the same two things: a row of filters,
+ * and one sentence saying what the rows below add up to. Both were re-declared
+ * in eight components with small unexplained differences in gap and margin;
+ * they live here now so the screens line up with each other.
+ */
+.toolbar {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 16px; flex-wrap: wrap;
+}
+.toolbar--split { justify-content: space-between; gap: 16px; }
+.toolbar--ends  { align-items: flex-end; }
+
+.lede {
+  padding: 12px 16px; border-radius: var(--r-md); margin-bottom: 16px;
+  font-size: 13px; line-height: 1.5; font-weight: 600;
+}
+.lede.crit { background: var(--err-soft);  color: var(--err-ink); }
+.lede.warn { background: var(--warn-soft); color: var(--warn-ink); }
+.lede.ok   { background: var(--ok-soft);   color: var(--ok-ink); }
+
+/*
+ * Fact grid: a labelled value in a hairline-separated cell. The dispute desk,
+ * the payout totals and the vendor track record were each drawing their own
+ * version of this; one definition keeps a "key / value / note" reading the same
+ * wherever it appears.
+ */
+.facts {
+  display: grid; gap: 1px; background: var(--ink-100);
+  border-radius: var(--r-sm); overflow: hidden;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.fact { background: var(--paper); padding: 10px 13px; }
+.fact .k {
+  font-size: 10px; font-weight: 700; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--ink-500);
+}
+.fact .v {
+  font-size: 13px; color: var(--ink-900); font-weight: 600;
+  margin-top: 3px; word-break: break-word;
+}
+.fact .n { font-size: 11.5px; color: var(--ink-500); margin-top: 3px; line-height: 1.45; }
+
 /* --- Segmented filter chips --------------------------------------------- */
 
 .chips { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }

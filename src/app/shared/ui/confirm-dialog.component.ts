@@ -1,5 +1,6 @@
 import { ChangeDetectionStrategy, Component, EventEmitter, Input, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { formatRupees } from './format';
 
 export interface ConfirmField {
   label: string;
@@ -20,6 +21,13 @@ export interface ConfirmRequest {
   /** One sentence naming the concrete thing being changed. */
   message: string;
   confirmLabel: string;
+  /**
+   * Wording for the button that walks away, when plain "Cancel" would collide
+   * with the action itself: a cancel-order dialog otherwise offers "Cancel
+   * order" beside "Cancel", where one destroys an order and the other destroys
+   * nothing. Say what the dismiss button *preserves* — "Keep order".
+   */
+  cancelLabel?: string;
   tone?: 'primary' | 'danger' | 'ok';
   /** Free-text capture — most Neerly mutations require a reason on the wire. */
   reason?: ConfirmField;
@@ -95,7 +103,7 @@ export interface ConfirmResult {
                 <label class="field-label" for="cd-amount">{{ a.label }}</label>
                 <input id="cd-amount" class="input num" type="number" min="0" step="0.01"
                        [max]="a.max ?? null" [(ngModel)]="amount" />
-                @if (a.max !== undefined) { <div class="hint">Maximum ₹{{ a.max }}</div> }
+                @if (a.max !== undefined) { <div class="hint">Maximum {{ maxLabel(a.max) }}</div> }
               }
               @if (request.reason; as r) {
                 <label class="field-label" [class.mt-12]="!!request.amount" for="cd-reason">{{ r.label }}</label>
@@ -107,7 +115,9 @@ export interface ConfirmResult {
           }
 
           <div class="foot">
-            <button type="button" class="btn btn--ghost" (click)="cancelled.emit()">Cancel</button>
+            <button type="button" class="btn btn--ghost" (click)="cancelled.emit()">
+              {{ request.cancelLabel ?? 'Cancel' }}
+            </button>
             <button type="button" class="btn"
                     [class.btn--primary]="tone() === 'primary'"
                     [class.btn--danger]="tone() === 'danger'"
@@ -143,6 +153,8 @@ export class ConfirmDialogComponent {
   amount: number | null = null;
 
   tone(): 'primary' | 'danger' | 'ok' { return this.req()?.tone ?? 'primary'; }
+
+  maxLabel(max: number) { return formatRupees(max); }
 
   valid(): boolean {
     const r = this.req();
