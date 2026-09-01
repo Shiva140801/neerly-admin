@@ -65,6 +65,7 @@ export class AuthService {
         refreshToken: resp.refreshToken,
         expiresAt: Date.parse(resp.accessExpiresAt)
       });
+      this.tokens.saveProfile(resp.user?.displayName);
       return resp;
     }));
   }
@@ -79,6 +80,7 @@ export class AuthService {
         refreshToken: resp.refreshToken,
         expiresAt: Date.parse(resp.accessExpiresAt)
       });
+      this.tokens.saveProfile(resp.user?.displayName);
       return resp;
     }));
   }
