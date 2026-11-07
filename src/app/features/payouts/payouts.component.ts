@@ -197,8 +197,14 @@ interface PayoutRow {
                       <button type="button" class="btn btn--ghost btn--sm" (click)="askRelease(r.payout)"
                               [disabled]="busyId() === r.payout.id">Release</button>
                     }
-                    @if (r.payout.status === 'COMPLETED' || r.payout.status === 'FAILED') {
+                    @if (r.payout.status === 'COMPLETED') {
                       <span class="muted">settled</span>
+                    }
+                    <!-- A failed transfer is money the vendor has not received. Calling it
+                         "settled" hid exactly the payouts that need a person. Resending is
+                         not built yet (Phase 4), so the honest state is "needs follow-up". -->
+                    @if (r.payout.status === 'FAILED') {
+                      <span class="pill pill--crit">Not received — follow up</span>
                     }
                   </span>
                 </td>

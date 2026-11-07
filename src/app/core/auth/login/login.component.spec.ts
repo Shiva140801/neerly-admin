@@ -26,7 +26,10 @@ describe('LoginComponent', () => {
 
   beforeEach(async () => {
     navigateSpy = jasmine.createSpy('navigate');
-    auth = jasmine.createSpyObj<AuthService>('AuthService', ['startLogin', 'verifyTotp']);
+    auth = jasmine.createSpyObj<AuthService>('AuthService', ['devLogin', 'startLogin', 'verifyTotp']);
+    // These specs cover the production path: the local-only dev endpoint isn't
+    // registered (404), so the component falls back to the two-step login.
+    auth.devLogin.and.returnValue(throwError(() => ({ status: 404 })));
     auth.startLogin.and.returnValue(of(sampleChallenge));
     auth.verifyTotp.and.returnValue(of(sampleExchange));
 
@@ -66,6 +69,15 @@ describe('LoginComponent', () => {
     component.submitCredentials();
     expect(component.step()).toBe('CREDENTIALS');
     expect(component.error()).toBe('Bad creds');
+  });
+
+  it('submitCredentials signs straight in through the dev endpoint when it exists', () => {
+    auth.devLogin.and.returnValue(of(sampleExchange));
+    component.email.set('dev-admin@neerly.in');
+    component.password.set('neerly-dev-admin');
+    component.submitCredentials();
+    expect(auth.startLogin).not.toHaveBeenCalled();
+    expect(navigateSpy).toHaveBeenCalledWith(['/dashboard']);
   });
 
   it('submitTotp navigates to /dashboard on success', () => {

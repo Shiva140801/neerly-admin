@@ -198,16 +198,16 @@ const HORIZONS = [7, 30, 60] as const;
 
     <div class="panel mt-24">
       <div class="panel-head">
-        <h2>Uploaded documents near expiry</h2>
-        <span class="text-label">{{ loading() ? 'still counting…' : docs().length + ' on file' }}</span>
+        <h2>Documents · waiting for review, then near expiry</h2>
+        <span class="text-label">{{ loading() ? 'still counting…' : (awaitingReview() + ' to review · ' + docs().length + ' on file') }}</span>
       </div>
 
       @if (loading() || docError() || docs().length === 0) {
         <app-data-state
-          what="expiring documents"
+          what="documents"
           [loading]="loading()" [error]="docError()"
-          emptyTitle="No documents near expiry"
-          emptyDetail="Nothing uploaded by a vendor is inside its 30-day expiry window. Submitted documents also appear here once a vendor uploads a renewal."
+          emptyTitle="Nothing to review, nothing near expiry"
+          emptyDetail="No vendor has a document waiting for review, and nothing approved is inside its 60-day expiry window."
           [clear]="true" [compact]="true"
           (retry)="reload()" />
       } @else {
@@ -344,15 +344,24 @@ export class ComplianceComponent {
   readonly licences = computed(() =>
     this.allLicences().filter(l => (l.days ?? Infinity) <= this.horizon()));
 
+  /**
+   * Waiting-for-review first (oldest upload first — a vendor may be blocked on it), then
+   * approved documents by days to expiry.
+   */
   readonly docs = computed<DocRow[]>(() => {
     const now = this.clock.now();
-    return this.rawDocs()
-      .map(doc => {
-        const days = daysUntilDate(doc.expiresDate, now);
-        return { doc, days, severity: expirySeverity(days) };
-      })
+    const rows = this.rawDocs().map(doc => {
+      const days = daysUntilDate(doc.expiresDate, now);
+      return { doc, days, severity: expirySeverity(days) };
+    });
+    const waiting = rows.filter(r => r.doc.status === 'SUBMITTED')
+      .sort((a, b) => (a.doc.uploadedAt ?? '').localeCompare(b.doc.uploadedAt ?? ''));
+    const rest = rows.filter(r => r.doc.status !== 'SUBMITTED')
       .sort((a, b) => (a.days ?? 9999) - (b.days ?? 9999));
+    return [...waiting, ...rest];
   });
+
+  readonly awaitingReview = computed(() => this.rawDocs().filter(d => d.status === 'SUBMITTED').length);
 
   countFor(h: number): number {
     return this.allLicences().filter(l => (l.days ?? Infinity) <= h).length;
@@ -388,6 +397,10 @@ export class ComplianceComponent {
     if (soon.length) {
       return { severity: 'warn', text: `${soon.length} licence${soon.length === 1 ? '' : 's'} lapse${soon.length === 1 ? 's' : ''} inside 30 days. Chase renewals now — FSSAI turnaround is not same-week.` };
     }
+    const toReview = this.awaitingReview();
+    if (toReview > 0) {
+      return { severity: 'warn', text: `${toReview} vendor document${toReview === 1 ? ' is' : 's are'} waiting for review — oldest first in the table below. Licence expiry looks clear for the next 30 days.` };
+    }
     if (docsSoon.length) {
       const first = docsSoon[0];
       return {
@@ -410,10 +423,20 @@ export class ComplianceComponent {
               catchError(e => of({ ok: false as const, message: describeError(e, 'vendor licences') }))),
       docs: this.api.get<ComplianceDoc[]>('/admin/compliance/expiring', { withinDays: 60 })
         .pipe(map(r => ({ ok: true as const, rows: Array.isArray(r) ? r : [] })),
-              catchError(e => of({ ok: false as const, message: describeError(e, 'expiring documents') })))
-    }).subscribe(({ vendors, docs }) => {
+              catchError(e => of({ ok: false as const, message: describeError(e, 'expiring documents') }))),
+      // The review queue. Before it existed this screen only ever received approved
+      // documents, so Approve / Reject could never appear and nothing could be approved.
+      submitted: this.api.get<Page<ComplianceDoc>>('/admin/compliance', { status: 'SUBMITTED', page: 0, size: 100 })
+        .pipe(map(p => ({ ok: true as const, rows: p?.content ?? [] })),
+              catchError(e => of({ ok: false as const, message: describeError(e, 'documents to review') })))
+    }).subscribe(({ vendors, docs, submitted }) => {
       if (vendors.ok) this.vendors.set(vendors.rows); else this.vendorError.set(vendors.message);
-      if (docs.ok) this.rawDocs.set(docs.rows); else this.docError.set(docs.message);
+      if (docs.ok && submitted.ok) {
+        const seen = new Set<string>();
+        this.rawDocs.set([...submitted.rows, ...docs.rows].filter(d => !seen.has(d.id) && !!seen.add(d.id)));
+      } else {
+        this.docError.set(!submitted.ok ? submitted.message : (docs as { message: string }).message);
+      }
       this.loading.set(false);
       this.clock.sync();
     });
