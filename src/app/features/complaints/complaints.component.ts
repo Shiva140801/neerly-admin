@@ -373,7 +373,7 @@ const BAND_ORDER: Band[] = ['breached', 'soon', 'today', 'later', 'done'];
                           placeholder="What you decided and why. Both the customer and the vendor see this."></textarea>
                 @if (movesMoney()) {
                   <div class="mt-12 text-meta" style="color:var(--warn-ink);font-weight:600;">
-                    {{ label(resolveAction!) }} takes money out of the platform. It cannot be clawed back once published.
+                    {{ label(resolveAction!) }} credits the customer's wallet with this amount the moment you publish — as real money they can spend or withdraw. It cannot be clawed back. For a refund to their bank, use Refunds instead.
                   </div>
                 }
                 <div class="mt-12">

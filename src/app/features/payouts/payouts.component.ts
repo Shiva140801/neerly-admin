@@ -30,6 +30,8 @@ interface Payout {
   status: PayoutStatus;
   razorpayPayoutId: string | null;
   utr: string | null;
+  bankName?: string | null;      // the account this payout went to — snapshot at creation
+  accountMasked?: string | null;
   holdReason: string | null;
   failureReason: string | null;
   createdAt: string;
@@ -161,7 +163,8 @@ interface PayoutRow {
                   <div class="sub-cell">staged {{ r.payout.createdAt | when:'date' }}</div>
                 </td>
                 <td>{{ r.payout.periodStart | when:'date' }} – {{ r.payout.periodEnd | when:'date' }}</td>
-                <td>{{ vendorName(r.payout) }}</td>
+                <td>{{ vendorName(r.payout) }}
+                  @if (r.payout.accountMasked) { <div class="muted" style="font-size:12px;">to {{ r.payout.bankName ?? 'bank' }} {{ r.payout.accountMasked }}</div> }</td>
                 <td class="right">
                   <span class="amt">{{ r.payout.netTotal | rupees }}</span>
                   <div class="split">

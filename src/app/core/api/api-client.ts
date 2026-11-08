@@ -42,6 +42,10 @@ export class ApiClient {
     return this.http.post<T>(`${API_ROOT}${path}`, body ?? {});
   }
 
+  put<T>(path: string, body?: unknown): Observable<T> {
+    return this.http.put<T>(`${API_ROOT}${path}`, body ?? {});
+  }
+
   patch<T>(path: string, body?: unknown): Observable<T> {
     return this.http.patch<T>(`${API_ROOT}${path}`, body ?? {});
   }

@@ -4,7 +4,9 @@ import { filter } from 'rxjs/operators';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { AuthService } from '../../auth/auth.service';
 import { TokenStore } from '../../auth/token.store';
+import { AdminRole, atLeast } from '../../auth/roles';
 import { AttentionService, QueueKey } from '../../../shared/attention.service';
+import { SosWatchService } from '../../../shared/sos-watch.service';
 import { ClockService } from '../../../shared/ui/clock.service';
 import { ToastHostComponent } from '../../../shared/ui/toast-host.component';
 import { Severity } from '../../../shared/ui/urgency';
@@ -24,6 +26,8 @@ interface NavItem {
   pending?: boolean;
   /** Spelled-out meaning of the badge, for the title attribute and screen readers. */
   countLabel?: string;
+  /** Lowest admin level that may open it; hidden below that (mirrors the backend gate). */
+  minRole?: AdminRole;
 }
 
 interface NavGroup { heading: string; items: NavItem[] }
@@ -222,6 +226,7 @@ export class ShellComponent {
   private router = inject(Router);
   private attention = inject(AttentionService);
   private clock = inject(ClockService);
+  private sos = inject(SosWatchService);
 
   /** Drawer state. Desktop ignores it — the rail is always in the grid there. */
   readonly navOpen = signal(false);
@@ -229,6 +234,8 @@ export class ShellComponent {
   constructor() {
     // One fetch on entry feeds both the badges and whichever screen loads next.
     this.attention.refresh();
+    // Driver SOS is polled for the whole session, whatever screen is open.
+    this.sos.start();
     // A route change from anywhere (a deep link inside a screen, a redirect)
     // closes the drawer, so the nav never sits open over the page it opened.
     this.router.events.pipe(
@@ -264,6 +271,7 @@ export class ShellComponent {
       .reduce((sum, q) => sum + q.count, 0));
 
   readonly groups = computed<NavGroup[]>(() => {
+    const role = this.tokens.identity().role;
     const byKey = new Map(this.attention.queues(this.clock.now()).map(q => [q.key, q]));
 
     const withCount = (path: string, label: string, key: QueueKey): NavItem => {
@@ -281,11 +289,12 @@ export class ShellComponent {
       };
     };
 
-    return [
+    const all: NavGroup[] = [
       {
         heading: 'Triage',
         items: [
           { path: '/dashboard', label: 'Overview' },
+          this.sosItem(),
           withCount('/disputes', 'Disputes', 'disputes'),
           withCount('/orders', 'Orders', 'orders')
         ]
@@ -295,7 +304,9 @@ export class ShellComponent {
         items: [
           withCount('/vendors', 'Vendors', 'vendors'),
           withCount('/compliance', 'Compliance', 'compliance'),
-          { path: '/reviews', label: 'Reviews' }
+          { path: '/reviews', label: 'Reviews' },
+          { path: '/driver-papers', label: 'Driver papers' },
+          { path: '/code-overrides', label: 'Code overrides', minRole: 'ADMIN_L2' }
         ]
       },
       {
@@ -303,15 +314,17 @@ export class ShellComponent {
         items: [
           withCount('/refunds', 'Refunds', 'refunds'),
           withCount('/claims', 'Damage claims', 'claims'),
-          { path: '/payouts', label: 'Payouts' }
+          { path: '/payouts', label: 'Payouts', minRole: 'ADMIN_L2' },
+          { path: '/withdrawals', label: 'Withdrawals', minRole: 'ADMIN_L2' }
         ]
       },
       {
         heading: 'Levers',
         items: [
-          { path: '/pricing', label: 'Price bands' },
-          { path: '/promos', label: 'Promos' },
-          { path: '/surge', label: 'Surge' }
+          { path: '/pricing', label: 'Price bands', minRole: 'ADMIN_L2' },
+          { path: '/promos', label: 'Promos', minRole: 'ADMIN_L2' },
+          { path: '/surge', label: 'Surge', minRole: 'ADMIN_L2' },
+          { path: '/config', label: 'Config', minRole: 'ADMIN_L2' }
         ]
       },
       {
@@ -319,15 +332,35 @@ export class ShellComponent {
         items: [
           { path: '/analytics', label: 'Analytics' },
           { path: '/notifications', label: 'Notifications' },
-          { path: '/audit', label: 'Audit log' }
+          { path: '/audit', label: 'Audit log', minRole: 'ADMIN_L2' }
         ]
       }
     ];
+    // Only what this admin can open; a group left empty disappears.
+    return all
+      .map(g => ({ ...g, items: g.items.filter(i => !i.minRole || atLeast(role, i.minRole)) }))
+      .filter(g => g.items.length > 0);
   });
+
+  /** SOS: a person who may be hurt — red count whenever any alert is open. */
+  private sosItem(): NavItem {
+    const open = this.sos.open().length;
+    const loading = this.sos.loading();
+    const err = this.sos.error();
+    return {
+      path: '/sos', label: 'Driver SOS',
+      badge: loading ? '·' : err ? '!' : open > 0 ? String(open) : null,
+      pending: loading,
+      severity: err || open > 0 ? 'crit' : 'ok',
+      countLabel: loading ? 'Driver SOS — still checking' : err ? `Driver SOS — could not be checked: ${err}`
+        : open > 0 ? `${open} · driver${open === 1 ? '' : 's'} asking for help now` : 'No driver SOS open'
+    };
+  }
 
   signOut() {
     // Best-effort server-side revoke; local session ends regardless of outcome.
     const finish = () => {
+      this.sos.stop();
       this.tokens.clear();
       this.router.navigate(['/login']);
     };
