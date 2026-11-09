@@ -23,7 +23,9 @@ interface PresignReadResponse { url: string; expiresInSeconds?: number }
  * drawing empty grey squares and asking the operator to move a customer's
  * deposit on files they had never seen.
  *
- * `POST /uploads/presign-read` exchanges a key for a short-lived GET URL. Where
+ * `POST /uploads/presign-read` exchanges a key for a short-lived GET URL — a signed
+ * link to the backend's own `/media/{key}` while photos are kept in the database
+ * (setting `media.storage` = DB), or a presigned S3 URL once S3 is switched on. Where
  * object storage is not configured — local and CI have no AWS credentials, and
  * the endpoint answers 503 `UPLOAD_STORAGE_UNAVAILABLE` — the fallback is
  * deliberately honest: the key is shown as a labelled reference and the strip
@@ -64,7 +66,9 @@ export class EvidenceService {
           url: null,
           reason: status === 503 || code === 'UPLOAD_STORAGE_UNAVAILABLE'
             ? 'Object storage is not configured in this environment.'
-            : status === 404
+            : code === 'MEDIA_NOT_FOUND'
+              ? 'This file was never uploaded — the app sent a reference without the photo.'
+              : status === 404
               ? 'This backend cannot hand out view links yet.'
               : 'The storage service refused a view link for this file.'
         });
