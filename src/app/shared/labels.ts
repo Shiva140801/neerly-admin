@@ -104,6 +104,7 @@ const LABELS: Record<string, string> = {
   SHORT_QUANTITY: 'Short quantity',
   OVERCHARGED: 'Overcharged',
   OTHER: 'Other',
+  FAILED_DELIVERY: 'Driver marked not delivered',
   REFUND: 'Refund to original payment method',
   WALLET_CREDIT: 'Credit to Neerly wallet',
   REPLACEMENT: 'Replacement delivery',

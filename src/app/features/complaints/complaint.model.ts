@@ -1,6 +1,8 @@
 export type ComplaintCategory =
   | 'LATE_DELIVERY' | 'WRONG_PRODUCT' | 'DAMAGED_CONTAINER' | 'WATER_QUALITY'
-  | 'DRIVER_BEHAVIOUR' | 'SHORT_QUANTITY' | 'OVERCHARGED' | 'OTHER';
+  | 'DRIVER_BEHAVIOUR' | 'SHORT_QUANTITY' | 'OVERCHARGED' | 'OTHER'
+  /** "I was home" — the customer disputes a drop the driver closed as failed. */
+  | 'FAILED_DELIVERY';
 
 export type ComplaintStatus =
   | 'OPEN' | 'TRIAGED' | 'IN_PROGRESS' | 'RESOLVED' | 'CLOSED' | 'WITHDRAWN';
