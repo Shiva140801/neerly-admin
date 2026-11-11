@@ -315,6 +315,7 @@ export class ShellComponent {
           withCount('/refunds', 'Refunds', 'refunds'),
           withCount('/claims', 'Damage claims', 'claims'),
           { path: '/payouts', label: 'Payouts', minRole: 'ADMIN_L2' },
+          { path: '/bank-accounts', label: 'Bank accounts to verify', minRole: 'ADMIN_L2' },
           { path: '/withdrawals', label: 'Withdrawals', minRole: 'ADMIN_L2' }
         ]
       },

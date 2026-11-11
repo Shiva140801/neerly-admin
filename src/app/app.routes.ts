@@ -30,6 +30,7 @@ export const routes: Routes = [
       { path: 'code-overrides', canActivate: [roleGuard], data: { minRole: 'ADMIN_L2' }, loadComponent: () => import('./features/code-overrides/code-overrides.component').then(m => m.CodeOverridesComponent) },
       { path: 'orders', loadComponent: () => import('./features/orders/orders.component').then(m => m.OrdersComponent) },
       { path: 'analytics', loadComponent: () => import('./features/analytics/analytics.component').then(m => m.AnalyticsComponent) },
+      { path: 'bank-accounts', canActivate: [roleGuard], data: { minRole: 'ADMIN_L2' }, loadComponent: () => import('./features/bank-accounts/bank-accounts.component').then(m => m.BankAccountsComponent) },
       { path: 'withdrawals', canActivate: [roleGuard], data: { minRole: 'ADMIN_L2' }, loadComponent: () => import('./features/withdrawals/withdrawals.component').then(m => m.WithdrawalsComponent) },
       { path: 'config', canActivate: [roleGuard], data: { minRole: 'ADMIN_L2' }, loadComponent: () => import('./features/config/config.component').then(m => m.ConfigComponent) },
       { path: 'audit', canActivate: [roleGuard], data: { minRole: 'ADMIN_L2' }, loadComponent: () => import('./features/audit/audit.component').then(m => m.AuditComponent) },
