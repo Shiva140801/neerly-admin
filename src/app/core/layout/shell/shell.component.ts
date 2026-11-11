@@ -304,6 +304,7 @@ export class ShellComponent {
         items: [
           withCount('/vendors', 'Vendors', 'vendors'),
           withCount('/compliance', 'Compliance', 'compliance'),
+          { path: '/products-review', label: 'Products to review' },
           { path: '/reviews', label: 'Reviews' },
           { path: '/driver-papers', label: 'Driver papers' },
           { path: '/code-overrides', label: 'Code overrides', minRole: 'ADMIN_L2' }
